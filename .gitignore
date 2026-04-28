@@ -9,6 +9,7 @@ build/
 build_assets/
 build_obf/
 dist/
+/.venv
 pyarmor.bug.log
 
 # AI assistant prompts, plans, and local tool state
