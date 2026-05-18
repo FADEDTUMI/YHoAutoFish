@@ -1,4 +1,6 @@
 import base64
+import hmac
+import hashlib
 import json
 import os
 import time
@@ -28,6 +30,10 @@ class AuthState:
     activation_id: str = ""
     user_code: str = ""
     message: str = ""
+    refresh_token: str = ""
+    refresh_expires_at: float = 0.0
+    license_data: str = ""
+    license_expires_at: float = 0.0
 
     @classmethod
     def from_dict(cls, data):
@@ -43,11 +49,15 @@ class AuthState:
         state.activation_id = str(state.activation_id or "")
         state.user_code = str(state.user_code or "")
         state.message = str(state.message or "")
+        state.refresh_token = str(state.refresh_token or "")
+        state.license_data = str(state.license_data or "")
         state.expires_at = _as_float(state.expires_at)
         state.last_checked_at = _as_float(state.last_checked_at)
         state.local_checked_at = _as_float(state.local_checked_at)
         state.clock_skew_seconds = _as_float(state.clock_skew_seconds)
         state.monotonic_checked_at = _as_float(state.monotonic_checked_at)
+        state.refresh_expires_at = _as_float(state.refresh_expires_at)
+        state.license_expires_at = _as_float(state.license_expires_at)
         return state
 
     def to_dict(self, include_runtime=True):
@@ -91,18 +101,27 @@ class AuthState:
             return 0.0
         return current
 
-    def is_usable(self, now=None, offline_grace_seconds=0, monotonic_now=None):
+    def is_usable(self, now=None, offline_grace_seconds=0, monotonic_now=None, allow_license_fallback=False):
         current = time.time() if now is None else float(now)
         if self.status != "authorized" or not self.access_token:
+            if allow_license_fallback and self.license_data and self.license_expires_at > current:
+                return True
             return False
         estimated_server_now = self._estimated_server_now(current, monotonic_now=monotonic_now)
         if estimated_server_now <= 0:
+            if allow_license_fallback and self.license_data and self.license_expires_at > current:
+                return True
             return False
         if self.expires_at and estimated_server_now >= float(self.expires_at):
+            if allow_license_fallback and self.license_data and self.license_expires_at > current:
+                return True
             return False
         grace = max(0.0, float(offline_grace_seconds or 0))
         allowed_window = grace if grace > 0 else 60.0
-        return bool(self.last_checked_at and estimated_server_now <= float(self.last_checked_at) + allowed_window)
+        result = bool(self.last_checked_at and estimated_server_now <= float(self.last_checked_at) + allowed_window)
+        if not result and allow_license_fallback and self.license_data and self.license_expires_at > current:
+            return True
+        return result
 
 
 def _as_float(value):
@@ -110,6 +129,24 @@ def _as_float(value):
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _windows_machine_guid():
+    if os.name != "nt":
+        return ""
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as key:
+            value, _value_type = winreg.QueryValueEx(key, "MachineGuid")
+        return str(value).strip()
+    except Exception:
+        return ""
+
+
+def _compute_state_hmac(payload_bytes):
+    key = _windows_machine_guid().encode("utf-8") or b"default"
+    return hmac.new(key, payload_bytes, hashlib.sha256).hexdigest()
 
 
 def _default_store_path():
@@ -144,10 +181,12 @@ def save_auth_state(state, path=None):
     target.parent.mkdir(parents=True, exist_ok=True)
     raw = json.dumps(state.to_dict(include_runtime=False), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     protected, payload = _protect_bytes(raw)
+    integrity = _compute_state_hmac(payload)
     envelope = {
         "version": 1,
         "protected": protected,
         "payload": base64.b64encode(payload).decode("ascii"),
+        "integrity": integrity,
     }
     tmp_path = target.with_suffix(target.suffix + ".tmp")
     with open(tmp_path, "w", encoding="utf-8") as file:
@@ -168,6 +207,11 @@ def load_auth_state(path=None):
         raw = _unprotect_bytes(payload, bool(envelope.get("protected", False)))
         if not raw:
             return AuthState(status="unknown", message="本地授权缓存无法解密")
+        expected_integrity = envelope.get("integrity")
+        if expected_integrity is not None:
+            actual_integrity = _compute_state_hmac(payload)
+            if not hmac.compare_digest(str(expected_integrity), actual_integrity):
+                return AuthState(status="unknown", message="本地授权缓存完整性校验失败")
         return AuthState.from_dict(json.loads(raw.decode("utf-8")))
     except Exception as exc:
         return AuthState(status="unknown", message=f"本地授权缓存读取失败: {exc}")
