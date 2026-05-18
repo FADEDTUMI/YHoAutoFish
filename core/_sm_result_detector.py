@@ -148,7 +148,7 @@ class ResultDetector:
         return None
 
     def detect_fast_success_result(self, rect, fast_only=False):
-        if self._sm._detect_initial_f_prompt_quick(rect, threshold=0.88):
+        if self._sm.cast_det.detect_initial_f_prompt_quick(rect, threshold=0.88):
             return None
         ultra_info = self.detect_ultrafast_success_result(rect)
         if ultra_info and ultra_info.get("location"):
@@ -241,7 +241,7 @@ class ResultDetector:
         )
 
     def detect_success_result(self, rect):
-        if self._sm._detect_initial_f_prompt_quick(rect, threshold=0.88):
+        if self._sm.cast_det.detect_initial_f_prompt_quick(rect, threshold=0.88):
             return None
 
         success_signals = []
@@ -603,9 +603,9 @@ class ResultDetector:
             if getattr(self._sm, "_stop_requested", False):
                 return False
             current_rect = self._sm.wm.get_client_rect() or rect
-            ready_info = self._sm._detect_cast_prompt_after_settlement(current_rect)
+            ready_info = self._sm.cast_det.detect_cast_prompt_after_settlement(current_rect)
             if not (ready_info and ready_info.get("location")):
-                ready_info = self._sm._detect_ready_to_cast(current_rect, allow_heavy=False, require_initial_controls=True)
+                ready_info = self._sm.cast_det.detect_ready_to_cast(current_rect, allow_heavy=False, require_initial_controls=True)
             if ready_info and ready_info.get("location"):
                 self._sm._log(f"[结算] 已检测到{ready_info.get('kind') or '可抛钩界面'}，提前进入下一轮。")
                 return True

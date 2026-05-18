@@ -52,7 +52,10 @@ class VisionCore:
         if use_binary:
             _, gray = cv2.threshold(gray, binary_threshold, 255, cv2.THRESH_BINARY)
         elif use_edge:
-            gray = cv2.Canny(gray, 50, 150)
+            v = np.median(gray)
+            lower = int(max(0, (1.0 - 0.33) * v))
+            upper = int(min(255, (1.0 + 0.33) * v))
+            gray = cv2.Canny(gray, lower, upper)
         return gray
 
     def _template_for_match(self, template_path, use_edge=False, use_binary=False, binary_threshold=200):
@@ -97,7 +100,10 @@ class VisionCore:
                 self._processed_template_cache[cache_key] = None
                 return None
             if use_edge:
-                mask = cv2.Canny(gray, 50, 150)
+                v = np.median(gray)
+                lower = int(max(0, (1.0 - 0.33) * v))
+                upper = int(min(255, (1.0 + 0.33) * v))
+                mask = cv2.Canny(gray, lower, upper)
                 mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
             elif use_binary:
                 threshold = max(1, min(245, int(binary_threshold) - 25))
@@ -129,9 +135,7 @@ class VisionCore:
             return [low]
         scales = list(np.linspace(high, low, steps))
         common_scales = (
-            0.50, 0.5625, 0.625, 0.667, 0.75, 0.80, 0.833, 0.875,
-            0.90, 1.0, 1.10, 1.125, 1.20, 1.25, 1.333, 1.50,
-            1.60, 1.667, 1.75, 2.0, 2.25, 2.50, 2.667, 3.0,
+            0.50, 0.625, 0.75, 0.80, 0.90, 1.0, 1.10, 1.25, 1.50, 1.75, 2.0, 3.0,
         )
         if steps >= 7:
             scales.extend(scale for scale in common_scales if low <= scale <= high)
@@ -608,7 +612,7 @@ class VisionCore:
         cursor_mask = cv2.morphologyEx(cursor_mask, cv2.MORPH_OPEN, cursor_kernel)
         cursor_mask = cv2.morphologyEx(cursor_mask, cv2.MORPH_CLOSE, cursor_kernel)
 
-        cursor_candidates = self._collect_cursor_components(cursor_mask, roi_w, roi_h)
+        cursor_candidates = self._collect_cursor_components(cursor_mask, roi_w, roi_h, hsv_roi=hsv)
         cursor = self._select_cursor_candidate(cursor_candidates, green_candidates, roi_w, roi_h)
         needs_template = cursor is None or cursor.get("confidence", 0.0) < 0.55 or cursor.get("score", 0.0) < 0.58
         if cursor_template_paths and needs_template:
@@ -760,9 +764,9 @@ class VisionCore:
             return None
 
         strategies = (
-            {"name": "cursor-gray-mask", "threshold": 0.66, "use_mask": True, "mask_threshold": 5},
-            {"name": "cursor-binary-mask", "threshold": 0.60, "use_binary": True, "binary_threshold": 150, "use_mask": True},
-            {"name": "cursor-edge", "threshold": 0.52, "use_edge": True},
+            {"name": "cursor-gray-mask", "threshold": 0.70, "use_mask": True, "mask_threshold": 5},
+            {"name": "cursor-binary-mask", "threshold": 0.64, "use_binary": True, "binary_threshold": 150, "use_mask": True},
+            {"name": "cursor-edge", "threshold": 0.56, "use_edge": True},
         )
         loc, conf, matched_path, strategy = self.find_best_template_multi_strategy(
             roi_img,
@@ -897,10 +901,10 @@ class VisionCore:
             "strategy": strategy,
         }
 
-    def _collect_cursor_components(self, mask, roi_w, roi_h):
+    def _collect_cursor_components(self, mask, roi_w, roi_h, hsv_roi=None):
         count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
         candidates = []
-        min_area = max(6, int(roi_w * roi_h * 0.00025))
+        min_area = max(10, int(roi_w * roi_h * 0.0004))
 
         for index in range(1, count):
             x, y, w, h, area = stats[index]
@@ -909,14 +913,27 @@ class VisionCore:
             if w > max(12, int(h * 0.44)):
                 continue
             aspect = h / max(w, 1)
-            if aspect < 1.05:
+            if aspect < 1.8:
+                continue
+            rect_area = w * h
+            extent = area / max(rect_area, 1)
+            if extent < 0.55:
                 continue
             cx, cy = centroids[index]
             vertical_score = min(1.0, aspect / 3.0)
             height_score = min(1.0, h / max(1, roi_h * 0.55))
             area_score = min(1.0, area / max(1, roi_w * roi_h * 0.012))
             center_score = 1.0 - min(1.0, abs(cy - roi_h * 0.5) / max(1.0, roi_h * 0.65))
-            confidence = max(0.0, min(0.98, vertical_score * 0.34 + height_score * 0.30 + area_score * 0.20 + center_score * 0.16))
+            color_concentration = 0.5
+            if hsv_roi is not None:
+                region_mask = (labels[y:y+h, x:x+w] == index)
+                region_hsv = hsv_roi[y:y+h, x:x+w][region_mask]
+                if len(region_hsv) > 10:
+                    h_std = float(np.std(region_hsv[:, 0].astype(float)))
+                    color_concentration = max(0.0, min(1.0, 1.0 - (h_std / 20.0)))
+            confidence = max(0.0, min(0.98,
+                vertical_score * 0.28 + height_score * 0.25 +
+                area_score * 0.15 + center_score * 0.12 + color_concentration * 0.20))
             score = confidence + area_score * 0.15
             candidates.append({
                 "x": int(x),
@@ -927,6 +944,7 @@ class VisionCore:
                 "cx": float(cx),
                 "cy": float(cy),
                 "confidence": confidence,
+                "color_concentration": color_concentration,
                 "score": score,
                 "source": "color",
             })
@@ -1003,7 +1021,8 @@ class VisionCore:
 
             template_bonus = 0.18 if candidate.get("source") == "template" else 0.0
             confidence = float(candidate.get("confidence", 0.0))
-            score = confidence * 0.42 + band_score * 0.24 + center_score * 0.12 + slender_score * 0.12 + edge_score * 0.10 + template_bonus
+            color_c = float(candidate.get("color_concentration", 0.5))
+            score = confidence * 0.30 + color_c * 0.16 + band_score * 0.22 + center_score * 0.10 + slender_score * 0.10 + edge_score * 0.10 + template_bonus
             if candidate.get("source") == "template" and confidence >= 0.78:
                 score += 0.06
             candidate["score"] = max(0.0, min(1.20, score))
@@ -1030,7 +1049,9 @@ class VisionCore:
 
         value = hsv[:, :, 2]
         saturation = hsv[:, :, 1]
-        dark_mask = (value < 105) | ((value < 140) & (saturation < 130))
+        scene_brightness = float(np.median(value))
+        dark_thresh = min(105, max(55, scene_brightness * 0.75))
+        dark_mask = (value < dark_thresh) | ((value < dark_thresh + 35) & (saturation < 130))
 
         ratios = []
         for y1, y2 in ((top_y1, top_y2), (bottom_y1, bottom_y2)):

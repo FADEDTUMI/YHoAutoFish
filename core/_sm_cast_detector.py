@@ -376,7 +376,7 @@ class CastDetector:
     # 8. 检测可能阻塞抛竿的结算界面
     # ------------------------------------------------------------------
     def detect_blocking_result_for_cast(self, rect):
-        success_info = self._sm._detect_ultrafast_success_result(rect)
+        success_info = self._sm.result_det.detect_ultrafast_success_result(rect)
         if success_info and success_info.get("location"):
             return {
                 "kind": "成功结算界面",
@@ -389,8 +389,8 @@ class CastDetector:
                 "block_reason": "success_result",
             }
 
-        failed_info = self._sm._detect_fast_failed_result(rect)
-        if failed_info and failed_info.get("location") and self._sm._is_strong_failed_result(failed_info):
+        failed_info = self._sm.result_det.detect_fast_failed_result(rect)
+        if failed_info and failed_info.get("location") and self._sm.result_det.is_strong_failed_result(failed_info):
             return {
                 "kind": "失败结算界面",
                 "confidence": failed_info.get("confidence", 0.0),
@@ -414,11 +414,11 @@ class CastDetector:
         reason = (ready_info or {}).get("block_reason")
         if reason == "success_result":
             self._sm._log(f"[{source_label}] 检测到成功结算界面仍未处理，优先进入结算流程。")
-            self._sm._finish_fast_success_result(rect, result_info, source_label=source_label)
+            self._sm.result_det.finish_fast_success_result(rect, result_info, source_label=source_label)
             return True
 
         if reason == "failed_result":
-            return self._sm._maybe_finish_failed_result(rect, result_info, source_label=source_label)
+            return self._sm.result_det.maybe_finish_failed_result(rect, result_info, source_label=source_label)
 
         return False
 

@@ -172,7 +172,7 @@ class AutoSeller:
     def fail(self, reason, press_esc=True, rect=None):
         self._sm._log(f"[售鱼] {reason}，本次自动售鱼停止，避免继续误操作。")
         if press_esc and not self._sm._should_stop():
-            ready_info = self._sm._detect_ready_to_cast(
+            ready_info = self._sm.cast_det.detect_ready_to_cast(
                 rect, allow_heavy=False, require_initial_controls=True
             ) if rect else None
             if not (ready_info and ready_info.get("location")):

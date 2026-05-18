@@ -197,7 +197,7 @@ class FishingBarDetector:
         if current_direction == 0:
             return False
 
-        self._sm._apply_fishing_control_direction(current_direction)
+        self._sm.fish_ctrl.apply_direction(current_direction)
         return True
 
     # ------------------------------------------------------------------
