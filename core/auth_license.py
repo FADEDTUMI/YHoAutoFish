@@ -100,8 +100,8 @@ def is_license_usable(license_blob, now=None):
     expected_device_hash = payload.get("device_hash_v2")
     if expected_device_hash:
         try:
-            from core.auth_device import get_device_hash_v2
-            current_hash = get_device_hash_v2()
+            from core.auth_device import build_device_hash_v2
+            current_hash = build_device_hash_v2()
             if current_hash and current_hash != expected_device_hash:
                 return (False, "device_mismatch", "License 与当前设备不匹配", 0.0, False)
         except Exception:

@@ -140,7 +140,7 @@ def build_device_hash_v2(install_id=None, hw_ids=None):
     if hw_ids is None:
         hw_ids = _collect_hardware_ids()
     parts = [
-        "YHoAutoFish-device-v1",
+        "YHoAutoFish-device-v2",
         f"install_id={local_install_id}",
         f"bios_uuid={hw_ids.get('bios_uuid', '')}",
         f"cpu_id={hw_ids.get('cpu_id', '')}",
