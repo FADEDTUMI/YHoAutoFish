@@ -1,9 +1,24 @@
+import re
 from urllib.parse import urlparse
 
 
-AUTH_SERVER_IP = "106.52.97.207"
-AUTH_PUBLIC_BASE_URL = f"https://{AUTH_SERVER_IP}/api"
-TRUSTED_AUTH_HOSTS = {AUTH_SERVER_IP}
+AUTH_SERVER_HOSTS = ["106.52.97.207", "auth.fadedai.club"]
+
+# Backward compatibility: keep AUTH_SERVER_IP as the first (IP) entry
+AUTH_SERVER_IP = AUTH_SERVER_HOSTS[0]
+AUTH_PUBLIC_BASE_URL = f"https://{AUTH_SERVER_HOSTS[0]}/api"
+TRUSTED_AUTH_HOSTS = set(AUTH_SERVER_HOSTS)
+
+# Pre-compiled regex for IPv4 detection
+_IPV4_RE = re.compile(
+    r"^(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)"
+    r"(?:\.(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)){3}$"
+)
+
+
+def is_ip_host(host: str) -> bool:
+    """Return True if *host* looks like an IPv4 address."""
+    return bool(_IPV4_RE.match(host.strip()))
 
 
 class AuthPolicyError(ValueError):
