@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 import ssl
 import time
@@ -7,12 +8,13 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from core.auth_policy import AUTH_SERVER_HOSTS, is_ip_host
 from core.paths import app_base_dir, resource_path
 
 
 AUTH_CA_FILENAMES = ("yho_auth_ca.pem", "yho_root_ca.pem")
-AUTH_CHECK_INTERVAL_SECONDS = 60
-AUTH_OFFLINE_GRACE_SECONDS = 5 * 60
+AUTH_CHECK_INTERVAL_SECONDS = 300
+AUTH_OFFLINE_GRACE_SECONDS = 14 * 24 * 60 * 60
 DETERMINISTIC_AUTH_FAILURE_STATUSES = {
     "not_found",
     "released",
@@ -243,6 +245,13 @@ def _copy_ca_to_stable_path(source_path):
     return str(source)
 
 
+def _ca_for_host(host, default_ca_path=None):
+    """Return CA cert path for host. IP uses custom CA, domain uses system trust store."""
+    if is_ip_host(host):
+        return default_ca_path
+    return None  # System trust store for domain names
+
+
 def find_auth_ca_bundle(base_dir=None):
     if base_dir is not None:
         for filename in AUTH_CA_FILENAMES:
@@ -271,6 +280,7 @@ class AuthClient:
         self.transport = transport
         self.ca_bundle_path = ca_bundle_path if ca_bundle_path is not None else find_auth_ca_bundle()
         self._ssl_context = None
+        self.is_failover = False
         if not self.base_url:
             raise AuthClientError("授权服务器地址未配置")
 
@@ -352,16 +362,17 @@ class AuthClient:
                 raise AuthClientError("授权服务器请求超时") from exc
         raise AuthClientError(str(last_error) if last_error else "授权服务器请求失败")
 
-    def start_activation(self, device_hash, install_id, app_version):
-        return self._request(
-            "POST",
-            "/activation/start",
-            {
-                "device_hash": device_hash,
-                "install_id": install_id,
-                "app_version": app_version,
-            },
-        )
+    def start_activation(self, device_hash, install_id, app_version, device_hash_v2="", hw_ids=None):
+        body = {
+            "device_hash": device_hash,
+            "install_id": install_id,
+            "app_version": app_version,
+        }
+        if device_hash_v2:
+            body["device_hash_v2"] = device_hash_v2
+        if hw_ids:
+            body["hw_ids"] = hw_ids
+        return self._request("POST", "/activation/start", body)
 
     def poll_activation(self, activation_id, device_hash):
         return self._request(
@@ -373,13 +384,13 @@ class AuthClient:
             },
         )
 
-    def check_entitlement(self, access_token, device_hash):
-        return self._request(
-            "POST",
-            "/entitlement/check",
-            {"device_hash": device_hash},
-            token=access_token,
-        )
+    def check_entitlement(self, access_token, device_hash, device_hash_v2="", hw_ids=None):
+        body = {"device_hash": device_hash}
+        if device_hash_v2:
+            body["device_hash_v2"] = device_hash_v2
+        if hw_ids:
+            body["hw_ids"] = hw_ids
+        return self._request("POST", "/entitlement/check", body, token=access_token)
 
     def get_entitlement_status(self, access_token, device_hash):
         return self._request(
@@ -391,6 +402,28 @@ class AuthClient:
 
     def list_public_groups(self):
         return self._request("GET", "/public/groups")
+
+    def _request_with_failover(self, method, path, payload=None, token=None):
+        """Try each host in AUTH_SERVER_HOSTS until one succeeds. IP first for low latency."""
+        last_error = None
+        for host in AUTH_SERVER_HOSTS:
+            try:
+                base_url = f"https://{host}/api"
+                ca_path = _ca_for_host(host, self.ca_bundle_path)
+                client = AuthClient(base_url, timeout=self.timeout, ca_bundle_path=ca_path)
+                client.is_failover = True
+                return client._request(method, path, payload, token)
+            except AuthClientError as exc:
+                last_error = exc
+                continue
+        raise AuthClientError(str(last_error) if last_error else "所有授权服务器均不可达")
+
+    def refresh_access_token(self, refresh_token, device_hash_v2="", device_hash=""):
+        """Exchange refresh_token for new access_token + new refresh_token (rotation)."""
+        payload = {"device_hash": device_hash}
+        if device_hash_v2:
+            payload["device_hash_v2"] = device_hash_v2
+        return self._request("POST", "/token/refresh", payload, token=refresh_token)
 
 
 def auth_config_required(config):
@@ -416,6 +449,17 @@ def decide_cached_authorization(config, state, now=None):
     if not auth_config_required(config):
         return GateDecision(True, "disabled", "来源验证未启用")
     current = time.time() if now is None else float(now)
+    # First try normal online auth
     if state is not None and state.is_usable(current, auth_offline_grace_seconds(config)):
         return GateDecision(True, "authorized", "授权缓存有效")
+    # Then try license-based offline auth
+    try:
+        from core.auth_license import is_license_usable, load_license
+        license_blob = load_license()
+        if license_blob:
+            usable, status, message, expires_at, should_renew = is_license_usable(license_blob, now=current)
+            if usable:
+                return GateDecision(True, "licensed", f"离线授权有效 ({message})")
+    except ImportError:
+        pass
     return GateDecision(False, "needs_activation", "需要完成来源验证")

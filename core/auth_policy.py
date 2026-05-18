@@ -9,16 +9,12 @@ AUTH_SERVER_IP = AUTH_SERVER_HOSTS[0]
 AUTH_PUBLIC_BASE_URL = f"https://{AUTH_SERVER_HOSTS[0]}/api"
 TRUSTED_AUTH_HOSTS = set(AUTH_SERVER_HOSTS)
 
-# Pre-compiled regex for IPv4 detection
-_IPV4_RE = re.compile(
-    r"^(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)"
-    r"(?:\.(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)){3}$"
-)
+_IPV4_RE = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
 
 
-def is_ip_host(host: str) -> bool:
+def is_ip_host(host):
     """Return True if *host* looks like an IPv4 address."""
-    return bool(_IPV4_RE.match(host.strip()))
+    return bool(_IPV4_RE.match(str(host or "").strip()))
 
 
 class AuthPolicyError(ValueError):
