@@ -1114,6 +1114,12 @@ class AuthorizationDialog(QDialog):
         layout.addWidget(self.group_scroll)
         self._render_groups([], "正在加载群列表...")
 
+        device_hint = QLabel("设备管理: 在 QQ 群发送 /yho devices 查看已绑定设备")
+        device_hint.setStyleSheet(
+            f"background: transparent; border: none; color: {APP_COLORS['text_dim']}; font-size: 11px;"
+        )
+        layout.addWidget(device_hint)
+
         actions = QHBoxLayout()
         actions.addStretch()
         self.copy_button = QPushButton("复制绑定码")
@@ -1324,9 +1330,18 @@ class AuthorizationDialog(QDialog):
         self.code_label.setText(f"已绑定的绑定码：{display_code}")
         self.instruction_label.setText(warning or "当前设备已完成来源验证。需要换设备时，请联系管理员释放旧设备后重新生成绑定码。")
         if self.current_user_code:
-            self.status_label.setText("授权有效。你可以复制已记录的绑定码，或关闭窗口继续使用。" + (f" {warning}" if warning else ""))
+            status_text = "授权有效。你可以复制已记录的绑定码，或关闭窗口继续使用。" + (f" {warning}" if warning else "")
         else:
-            self.status_label.setText("授权有效，正在从服务器同步绑定码。同步完成后可复制。" + (f" {warning}" if warning else ""))
+            status_text = "授权有效，正在从服务器同步绑定码。同步完成后可复制。" + (f" {warning}" if warning else "")
+        auth_state = self.app_window.auth_state
+        if getattr(auth_state, "expires_at", 0) > 0:
+            remaining = float(auth_state.expires_at) - time.time()
+            if remaining > 0:
+                days = int(remaining / 86400)
+                status_text += f"\n离线授权有效期剩余: {days} 天"
+            else:
+                status_text += "\n离线授权已过期，请联网续期"
+        self.status_label.setText(status_text)
         self.copy_button.setEnabled(bool(self.current_user_code))
         self.generate_button.setVisible(False)
         self.generate_button.setEnabled(False)
@@ -3780,7 +3795,14 @@ class AppWindow(QMainWindow):
         if decision.allowed:
             if self.auth_verified_this_session:
                 return "授权有效", "auth_ok", f"来源验证已通过。{fixed_policy}{warning_part}"
-            return "待复验", "auth_offline", f"本地授权缓存可用，正在等待在线复验。{fixed_policy}{warning_part}"
+            license_info = ""
+            if getattr(state, "expires_at", 0) > 0:
+                remaining = float(state.expires_at) - time.time()
+                if remaining > 0:
+                    license_info = f"离线授权剩余 {int(remaining / 86400)} 天。"
+                else:
+                    license_info = "离线授权已过期。"
+            return "待复验", "auth_offline", f"{license_info}本地授权缓存可用，正在等待在线复验。{fixed_policy}{warning_part}"
         if str(getattr(state, "status", "") or "") == "pending":
             return "待绑定", "auth_pending", f"绑定码已生成，请在指定 QQ 群完成 /bind。{fixed_policy}"
         return "未授权", "auth_bad", f"{detail or '需要完成来源验证'}。{fixed_policy}"
