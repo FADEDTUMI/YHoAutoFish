@@ -140,6 +140,46 @@ function Split-ReleaseFile {
     return @($Result.ToArray())
 }
 
+function Test-ForbiddenReleasePayload {
+    param(
+        [string]$PayloadRoot
+    )
+
+    $ForbiddenNames = @("auth_state.dat", "auth_device.json", "records.json")
+    foreach ($Name in $ForbiddenNames) {
+        $Matches = @(Get-ChildItem -LiteralPath $PayloadRoot -Recurse -File -Filter $Name -ErrorAction SilentlyContinue)
+        if ($Matches.Count -gt 0) {
+            $Paths = ($Matches | ForEach-Object { $_.FullName }) -join "; "
+            throw "Forbidden release payload file: $Name ($Paths)"
+        }
+    }
+}
+
+function Test-ForbiddenReleaseZip {
+    param(
+        [string]$ArchivePath
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $ForbiddenNames = @("auth_state.dat", "auth_device.json", "records.json")
+    $ZipStream = [System.IO.File]::OpenRead($ArchivePath)
+    try {
+        $ZipArchive = New-Object System.IO.Compression.ZipArchive($ZipStream, [System.IO.Compression.ZipArchiveMode]::Read)
+        try {
+            foreach ($Entry in $ZipArchive.Entries) {
+                $Name = [System.IO.Path]::GetFileName($Entry.FullName)
+                if ($ForbiddenNames -contains $Name) {
+                    throw "Forbidden release payload file: $($Entry.FullName)"
+                }
+            }
+        } finally {
+            $ZipArchive.Dispose()
+        }
+    } finally {
+        $ZipStream.Dispose()
+    }
+}
+
 if (-not $SkipInstall) {
     Invoke-Checked "python" @("-m", "pip", "install", "-r", "requirements.txt")
     Invoke-Checked "python" @("-m", "pip", "install", "-r", "requirements-build.txt")
@@ -200,9 +240,11 @@ $BundledRecords = Join-Path $DistDir "records.json"
 if (Test-Path -LiteralPath $BundledRecords) {
     Remove-Item -LiteralPath $BundledRecords -Force
 }
+Test-ForbiddenReleasePayload -PayloadRoot $DistDir
 
 New-Item -ItemType Directory -Force -Path $ReleaseDir | Out-Null
 Compress-Archive -Path $DistDir -DestinationPath $ZipPath -Force
+Test-ForbiddenReleaseZip -ArchivePath $ZipPath
 
 $ZipHash = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $SplitPartFiles = @()

@@ -1,8 +1,8 @@
 ﻿# UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 3, 0, 0),
-    prodvers=(1, 3, 0, 0),
+    filevers=(1, 3, 1, 0),
+    prodvers=(1, 3, 1, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -17,12 +17,12 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', 'FADEDTUMI'),
           StringStruct('FileDescription', 'YHo AutoFish'),
-          StringStruct('FileVersion', '1.3.0.0'),
+          StringStruct('FileVersion', '1.3.1.0'),
           StringStruct('InternalName', 'YHoAutoFish'),
           StringStruct('LegalCopyright', 'Copyright (c) 2026 FADEDTUMI. All rights reserved.'),
           StringStruct('OriginalFilename', 'YHoAutoFish.exe'),
           StringStruct('ProductName', 'YHo AutoFish'),
-          StringStruct('ProductVersion', '1.3.0')
+          StringStruct('ProductVersion', '1.3.1')
         ])
     ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])

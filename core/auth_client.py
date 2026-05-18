@@ -13,6 +13,27 @@ from core.paths import app_base_dir, resource_path
 AUTH_CA_FILENAMES = ("yho_auth_ca.pem", "yho_root_ca.pem")
 AUTH_CHECK_INTERVAL_SECONDS = 60
 AUTH_OFFLINE_GRACE_SECONDS = 5 * 60
+DETERMINISTIC_AUTH_FAILURE_STATUSES = {
+    "not_found",
+    "released",
+    "revoked",
+    "suspended",
+    "device_mismatch",
+    "expired",
+    "deleted",
+}
+AUTH_REBIND_STATUSES = {
+    "not_found",
+    "released",
+    "expired",
+    "token_already_issued",
+    "missing_token",
+}
+AUTH_ADMIN_BLOCKED_STATUSES = {
+    "revoked",
+    "suspended",
+    "deleted",
+}
 
 
 class AuthClientError(Exception):
@@ -24,6 +45,183 @@ class GateDecision:
     allowed: bool
     status: str
     message: str
+
+
+@dataclass
+class AuthRecoveryDecision:
+    mode: str
+    status: str
+    message: str
+    can_rebind: bool = False
+    can_recheck: bool = False
+    admin_blocked: bool = False
+    should_persist: bool = False
+
+
+def _normalized_status(value):
+    return str(value or "").strip().lower()
+
+
+def _diagnostic_device_statuses(check_result):
+    if not isinstance(check_result, dict):
+        return []
+    diagnostic = check_result.get("diagnostic")
+    if not isinstance(diagnostic, dict):
+        return []
+    records = diagnostic.get("device_records")
+    if not isinstance(records, list):
+        return []
+    statuses = []
+    for item in records:
+        if isinstance(item, dict):
+            status = _normalized_status(item.get("status"))
+            if status:
+                statuses.append(status)
+    return statuses
+
+
+def effective_auth_status(state=None, check_result=None):
+    result = check_result if isinstance(check_result, dict) else {}
+    explicit = _normalized_status(result.get("effective_status"))
+    if explicit:
+        return explicit
+    status = _normalized_status(result.get("status"))
+    device_statuses = _diagnostic_device_statuses(result)
+    if status == "not_found":
+        for item in device_statuses:
+            if item in AUTH_ADMIN_BLOCKED_STATUSES:
+                return item
+        for item in device_statuses:
+            if item in AUTH_REBIND_STATUSES:
+                return item
+    if status:
+        return status
+    return _normalized_status(getattr(state, "status", ""))
+
+
+def _default_recovery_message(mode, status, check_result=None):
+    result = check_result if isinstance(check_result, dict) else {}
+    raw_message = str(result.get("message") or "").strip()
+    if mode == "authorized":
+        return "授权有效"
+    if mode == "pending_activation":
+        return "绑定码已生成，请在指定 QQ 群发送 /bind 绑定码。"
+    if mode == "transient_error":
+        return raw_message or "授权服务器暂时不可达，请稍后重试。"
+    if mode == "admin_blocked":
+        return "授权已被管理员停用，不能自助重新绑定，请联系管理员处理。"
+    if mode == "device_mismatch":
+        return "这是其他设备的授权缓存，本机需要重新绑定。"
+    if mode == "can_rebind":
+        if status == "released":
+            return "旧设备授权已释放，可生成新绑定码重新绑定本机。"
+        if status == "expired":
+            return "授权已过期，可生成新绑定码重新绑定本机。"
+        if status == "token_already_issued":
+            return "这个绑定码已经领取过授权，请生成新绑定码重新绑定本机。"
+        return "服务器未找到旧授权记录，可能是换机/挂失释放或重绑完成；可生成新绑定码重新绑定本机。"
+    return raw_message or "授权缓存过期，请联网复验。"
+
+
+def classify_auth_recovery(state=None, check_result=None, network_error=False):
+    result = check_result if isinstance(check_result, dict) else {}
+    if network_error:
+        return AuthRecoveryDecision(
+            mode="transient_error",
+            status="network_error",
+            message=_default_recovery_message("transient_error", "network_error", result),
+            can_recheck=True,
+            should_persist=False,
+        )
+    if bool(result.get("authorized")):
+        return AuthRecoveryDecision(
+            mode="authorized",
+            status="authorized",
+            message=_default_recovery_message("authorized", "authorized", result),
+            should_persist=False,
+        )
+
+    state_status = _normalized_status(getattr(state, "status", ""))
+    result_status = _normalized_status(result.get("status"))
+    if state_status == "pending" and getattr(state, "activation_id", "") and getattr(state, "user_code", "") and not result_status:
+        return AuthRecoveryDecision(
+            mode="pending_activation",
+            status="pending",
+            message=_default_recovery_message("pending_activation", "pending", result),
+            should_persist=True,
+        )
+    status = effective_auth_status(state, result)
+    if status in AUTH_ADMIN_BLOCKED_STATUSES:
+        return AuthRecoveryDecision(
+            mode="admin_blocked",
+            status=status,
+            message=_default_recovery_message("admin_blocked", status, result),
+            admin_blocked=True,
+            should_persist=True,
+        )
+    if status == "device_mismatch":
+        return AuthRecoveryDecision(
+            mode="device_mismatch",
+            status=status,
+            message=_default_recovery_message("device_mismatch", status, result),
+            can_rebind=True,
+            should_persist=True,
+        )
+    rebind_allowed = result.get("rebind_allowed")
+    if rebind_allowed is True or status in AUTH_REBIND_STATUSES:
+        return AuthRecoveryDecision(
+            mode="can_rebind",
+            status=status or "missing_token",
+            message=_default_recovery_message("can_rebind", status, result),
+            can_rebind=True,
+            can_recheck=bool(getattr(state, "access_token", "")),
+            should_persist=True,
+        )
+    if getattr(state, "access_token", ""):
+        return AuthRecoveryDecision(
+            mode="recheck_only",
+            status=status or "needs_recheck",
+            message=_default_recovery_message("recheck_only", status, result),
+            can_recheck=True,
+            should_persist=False,
+        )
+    return AuthRecoveryDecision(
+        mode="can_rebind",
+        status=status or "missing_token",
+        message=_default_recovery_message("can_rebind", status or "missing_token", result),
+        can_rebind=True,
+        should_persist=False,
+    )
+
+
+def build_pending_activation_state(previous_state, activation_id, user_code, device_hash, message="等待 QQ 群绑定"):
+    from core.auth_store import AuthState
+
+    return AuthState(
+        status="pending",
+        access_token="",
+        license_id="",
+        device_hash=str(device_hash or ""),
+        qq_user_id_hash="",
+        expires_at=0.0,
+        last_checked_at=0.0,
+        activation_id=str(activation_id or ""),
+        user_code=str(user_code or ""),
+        message=str(message or "等待 QQ 群绑定"),
+    )
+
+
+def should_show_authorization_dialog_after_check(reason, recovery_mode, dismissed_until=0, now=None):
+    mode = str(recovery_mode or "")
+    if mode in ("authorized", "transient_error"):
+        return False
+    normalized_reason = str(reason or "scheduled")
+    if normalized_reason == "scheduled":
+        return False
+    if normalized_reason in ("manual", "action_gate"):
+        return True
+    current = time.time() if now is None else float(now)
+    return current >= float(dismissed_until or 0)
 
 
 def _copy_ca_to_stable_path(source_path):
@@ -205,6 +403,13 @@ def auth_offline_grace_seconds(config):
 
 def auth_check_interval_seconds(config):
     return AUTH_CHECK_INTERVAL_SECONDS
+
+
+def should_persist_auth_failure(status, network_error=False):
+    if network_error:
+        return False
+    normalized = str(status or "").strip().lower()
+    return normalized in DETERMINISTIC_AUTH_FAILURE_STATUSES
 
 
 def decide_cached_authorization(config, state, now=None):

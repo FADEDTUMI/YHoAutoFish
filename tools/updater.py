@@ -22,6 +22,10 @@ except Exception:
 APP_NAME = "YHoAutoFish"
 UPDATE_WORK_DIR_NAME = ".updates"
 PROTECTED_NAMES = {
+    "auth_device.json",
+    "auth_device.json.tmp",
+    "auth_state.dat",
+    "auth_state.dat.tmp",
     "config.json",
     "records.json",
     "records.db",

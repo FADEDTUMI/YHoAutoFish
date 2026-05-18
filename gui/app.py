@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -30,10 +31,21 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.auth_client import AuthClient, AuthClientError, auth_check_interval_seconds, auth_config_required, auth_offline_grace_seconds, decide_cached_authorization
+from core.auth_client import (
+    AuthClient,
+    AuthClientError,
+    auth_check_interval_seconds,
+    auth_config_required,
+    auth_offline_grace_seconds,
+    build_pending_activation_state,
+    classify_auth_recovery,
+    decide_cached_authorization,
+    should_persist_auth_failure,
+    should_show_authorization_dialog_after_check,
+)
 from core.auth_device import build_device_hash, get_or_create_install_id
 from core.auth_policy import get_auth_base_url
-from core.auth_store import AuthState, load_auth_state, save_auth_state
+from core.auth_store import AUTH_CLOCK_SKEW_WARNING_SECONDS, AuthState, load_auth_state, save_auth_state
 from core.paths import ensure_writable_file, resource_path
 from core.monthly_card_reset import (
     CONFIG_KEY_ENABLED as MONTHLY_CARD_RESET_ENABLED_KEY,
@@ -899,7 +911,7 @@ class UpdateDownloadWorker(QThread):
 
 
 class AuthCheckWorker(QThread):
-    completed = Signal(bool, object, str, bool)
+    completed = Signal(bool, object, str, bool, object)
 
     def __init__(self, base_url, state, device_hash, parent=None):
         super().__init__(parent)
@@ -916,6 +928,7 @@ class AuthCheckWorker(QThread):
             if self.isInterruptionRequested():
                 return
             if result.get("authorized"):
+                server_time = float(result.get("server_time") or time.time())
                 updated = AuthState(
                     status="authorized",
                     access_token=self.state.access_token,
@@ -923,20 +936,22 @@ class AuthCheckWorker(QThread):
                     device_hash=self.device_hash,
                     qq_user_id_hash=str(result.get("qq_user_id_hash") or self.state.qq_user_id_hash or ""),
                     expires_at=float(result.get("expires_at") or self.state.expires_at or 0),
-                    last_checked_at=float(result.get("server_time") or time.time()),
                     activation_id=self.state.activation_id,
                     user_code=str(result.get("user_code") or self.state.user_code or ""),
                     message="授权有效",
                 )
-                self.completed.emit(True, updated, "授权有效", False)
+                updated.apply_check_timing(server_time)
+                self.completed.emit(True, updated, "授权有效", False, result)
                 return
             updated = AuthState.from_dict(self.state.to_dict())
-            updated.status = str(result.get("status") or "denied")
-            updated.message = str(result.get("message") or "授权校验未通过")
-            self.completed.emit(False, updated, updated.message, False)
+            recovery = classify_auth_recovery(self.state, result, network_error=False)
+            if recovery.should_persist:
+                updated.status = recovery.status
+            updated.message = recovery.message or str(result.get("message") or "授权校验未通过")
+            self.completed.emit(False, updated, updated.message, False, result)
         except Exception as exc:
             if not self.isInterruptionRequested():
-                self.completed.emit(False, self.state, f"授权服务器连接失败: {exc}", True)
+                self.completed.emit(False, self.state, f"授权服务器连接失败: {exc}", True, {})
 
 
 class AuthActivationWorker(QThread):
@@ -1112,7 +1127,14 @@ class AuthorizationDialog(QDialog):
         self.start_button.setFocusPolicy(Qt.NoFocus)
         self.start_button.setStyleSheet(primary_button_stylesheet())
         self.start_button.clicked.connect(self.start_activation)
-        actions.addWidget(self.start_button)
+        self.generate_button = self.start_button
+        actions.addWidget(self.generate_button)
+
+        self.recheck_button = QPushButton("立即复验")
+        self.recheck_button.setFocusPolicy(Qt.NoFocus)
+        self.recheck_button.setStyleSheet(secondary_button_stylesheet())
+        self.recheck_button.clicked.connect(self.recheck_authorization)
+        actions.addWidget(self.recheck_button)
 
         self.close_button = QPushButton("稍后验证")
         self.close_button.setFocusPolicy(Qt.NoFocus)
@@ -1134,6 +1156,8 @@ class AuthorizationDialog(QDialog):
         self.poll_timer.stop()
         self._stop_worker()
         self._stop_group_worker()
+        if hasattr(self.app_window, "mark_authorization_dialog_dismissed"):
+            self.app_window.mark_authorization_dialog_dismissed()
         super().reject()
 
     def _stop_worker(self):
@@ -1164,9 +1188,12 @@ class AuthorizationDialog(QDialog):
 
     def _set_busy(self, busy):
         if getattr(self, "_bound_mode", False):
-            self.start_button.setEnabled(False)
+            self.generate_button.setEnabled(False)
+            self.recheck_button.setEnabled(False)
             return
-        self.start_button.setEnabled(not busy)
+        self.generate_button.setEnabled(not busy and self.generate_button.isVisible())
+        self.recheck_button.setEnabled(not busy and self.recheck_button.isVisible())
+        self.close_button.setEnabled(True)
 
     def _binding_status_text(self):
         state = self.app_window.auth_state
@@ -1186,23 +1213,68 @@ class AuthorizationDialog(QDialog):
         state = self.app_window.auth_state
         code = str(getattr(state, "user_code", "") or "").strip()
         activation_id = str(getattr(state, "activation_id", "") or "").strip()
+        recovery = classify_auth_recovery(state)
         if self.app_window._auth_decision().allowed:
             self._show_bound_code(code)
             return
-        if state.access_token:
+        if recovery.mode == "pending_activation" and activation_id and code:
+            self._show_code(code, activation_id)
+            self.poll_timer.start()
+            return
+        if recovery.mode in ("recheck_only", "transient_error"):
             self.poll_timer.stop()
             self._bound_mode = False
             self.current_user_code = code
             self.activation_id = ""
             display_code = code or "正在从服务器同步..."
             self.code_label.setText(f"已绑定的绑定码：{display_code}")
-            self.instruction_label.setText("本机已有授权记录，但当前在线复验未通过或已超过离线宽限。请先确认网络；若仍不可用，请点击“生成绑定码”重新绑定。")
-            self.status_label.setText(str(getattr(state, "message", "") or "授权暂不可用，请重新在线复验。"))
+            self.instruction_label.setText("授权缓存已超过离线宽限或服务器暂时不可达，请联网后点击“立即复验”。")
+            self.status_label.setText(self.app_window._auth_recovery_display_message(recovery, state))
             self.copy_button.setEnabled(bool(code))
-            self.start_button.setText("生成绑定码")
-            self.start_button.setToolTip("")
-            self.start_button.setEnabled(True)
+            self.generate_button.setVisible(False)
+            self.generate_button.setEnabled(False)
+            self.recheck_button.setVisible(True)
+            self.recheck_button.setText("立即复验")
+            self.recheck_button.setToolTip("使用本机已有授权令牌立即请求服务器复验。")
+            self.recheck_button.setEnabled(bool(state.access_token))
             self.close_button.setText("稍后验证")
+            self._refresh_binding_status_card()
+            return
+        if recovery.mode in ("can_rebind", "device_mismatch"):
+            self.poll_timer.stop()
+            self._bound_mode = False
+            self.current_user_code = code
+            self.activation_id = ""
+            display_code = code or "旧授权不可用"
+            self.code_label.setText(f"已绑定的绑定码：{display_code}")
+            self.instruction_label.setText(recovery.message)
+            self.status_label.setText(self.app_window._auth_recovery_display_message(recovery, state))
+            self.copy_button.setEnabled(bool(code))
+            self.generate_button.setVisible(True)
+            self.generate_button.setText("生成新绑定码")
+            self.generate_button.setToolTip("生成新的绑定码，在 QQ 群内重新绑定本机。")
+            self.generate_button.setEnabled(True)
+            self.recheck_button.setVisible(bool(state.access_token))
+            self.recheck_button.setEnabled(bool(state.access_token))
+            self.recheck_button.setText("立即复验")
+            self.recheck_button.setToolTip("再次使用本机旧授权令牌请求服务器复验。")
+            self.close_button.setText("稍后处理")
+            self._refresh_binding_status_card()
+            return
+        if recovery.mode == "admin_blocked":
+            self.poll_timer.stop()
+            self._bound_mode = False
+            self.current_user_code = code
+            self.activation_id = ""
+            self.code_label.setText("授权已停用")
+            self.instruction_label.setText(recovery.message)
+            self.status_label.setText(self.app_window._auth_recovery_display_message(recovery, state))
+            self.copy_button.setEnabled(False)
+            self.generate_button.setVisible(False)
+            self.generate_button.setEnabled(False)
+            self.recheck_button.setVisible(False)
+            self.recheck_button.setEnabled(False)
+            self.close_button.setText("关闭")
             self._refresh_binding_status_card()
             return
         if activation_id and code:
@@ -1216,9 +1288,12 @@ class AuthorizationDialog(QDialog):
         self.instruction_label.setText("点击“生成绑定码”后，将显示需要发送到 QQ 群的命令。")
         self.status_label.setText("等待操作")
         self.copy_button.setEnabled(False)
-        self.start_button.setText("生成绑定码")
-        self.start_button.setToolTip("")
-        self.start_button.setEnabled(True)
+        self.generate_button.setVisible(True)
+        self.generate_button.setText("生成绑定码")
+        self.generate_button.setToolTip("")
+        self.generate_button.setEnabled(True)
+        self.recheck_button.setVisible(False)
+        self.recheck_button.setEnabled(False)
         self.close_button.setText("稍后验证")
         self._refresh_binding_status_card()
 
@@ -1229,9 +1304,12 @@ class AuthorizationDialog(QDialog):
         self.instruction_label.setText(f"请在指定 QQ 群发送：/bind {code}。如不清楚机器人菜单，可在群里发送 /yho help。")
         self.status_label.setText("已生成绑定码，正在等待 QQ 群验证。")
         self.activation_id = activation_id
-        self.start_button.setText("生成绑定码")
-        self.start_button.setToolTip("")
-        self.start_button.setEnabled(True)
+        self.generate_button.setVisible(True)
+        self.generate_button.setText("重新生成绑定码")
+        self.generate_button.setToolTip("放弃当前绑定码并重新生成。")
+        self.generate_button.setEnabled(True)
+        self.recheck_button.setVisible(False)
+        self.recheck_button.setEnabled(False)
         self.close_button.setText("稍后验证")
         if hasattr(self, "copy_button"):
             self.copy_button.setEnabled(bool(self.current_user_code))
@@ -1242,16 +1320,19 @@ class AuthorizationDialog(QDialog):
         self.poll_timer.stop()
         self.current_user_code = str(code or "").strip()
         display_code = self.current_user_code or "正在从服务器同步..."
+        warning = self.app_window._auth_clock_skew_warning()
         self.code_label.setText(f"已绑定的绑定码：{display_code}")
-        self.instruction_label.setText("当前设备已完成来源验证。需要换设备时，请联系管理员释放旧设备后重新生成绑定码。")
+        self.instruction_label.setText(warning or "当前设备已完成来源验证。需要换设备时，请联系管理员释放旧设备后重新生成绑定码。")
         if self.current_user_code:
-            self.status_label.setText("授权有效。你可以复制已记录的绑定码，或关闭窗口继续使用。")
+            self.status_label.setText("授权有效。你可以复制已记录的绑定码，或关闭窗口继续使用。" + (f" {warning}" if warning else ""))
         else:
-            self.status_label.setText("授权有效，正在从服务器同步绑定码。同步完成后可复制。")
+            self.status_label.setText("授权有效，正在从服务器同步绑定码。同步完成后可复制。" + (f" {warning}" if warning else ""))
         self.copy_button.setEnabled(bool(self.current_user_code))
-        self.start_button.setText("已绑定")
-        self.start_button.setEnabled(False)
-        self.start_button.setToolTip("当前设备已完成来源验证，无需重新生成绑定码。")
+        self.generate_button.setVisible(False)
+        self.generate_button.setEnabled(False)
+        self.generate_button.setToolTip("当前设备已完成来源验证，无需重新生成绑定码。")
+        self.recheck_button.setVisible(False)
+        self.recheck_button.setEnabled(False)
         self.close_button.setText("关闭")
         self._refresh_binding_status_card()
 
@@ -1337,7 +1418,33 @@ class AuthorizationDialog(QDialog):
             row_layout.addWidget(join_btn)
             self.group_layout.addWidget(row)
 
+    def recheck_authorization(self):
+        if not self.app_window.auth_state.access_token:
+            self.status_label.setText("本机没有可复验的授权令牌，请生成绑定码重新绑定。")
+            return
+        self._set_busy(True)
+        self.status_label.setText("正在使用本机已有授权记录在线复验...")
+        self.app_window.start_authorization_check(silent=False, reason="manual")
+        QTimer.singleShot(1400, lambda: self._set_busy(False))
+
     def start_activation(self):
+        recovery = classify_auth_recovery(self.app_window.auth_state)
+        if self.app_window.auth_state.access_token and recovery.mode in ("recheck_only", "transient_error"):
+            self._set_busy(True)
+            self.status_label.setText("当前状态需要先在线复验...")
+            self.app_window.start_authorization_check(silent=False, reason="manual")
+            QTimer.singleShot(1400, lambda: self._set_busy(False))
+            return
+        if self.app_window.auth_state.access_token and recovery.mode in ("can_rebind", "device_mismatch"):
+            answer = QMessageBox.question(
+                self,
+                "重新绑定本机",
+                "将用新绑定码重新绑定本机，旧本地授权记录会保留在日志中但不再用于复验。是否继续？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if answer != QMessageBox.Yes:
+                return
         base_url = self.app_window._auth_base_url()
         self._stop_worker()
         self._set_busy(True)
@@ -1386,12 +1493,13 @@ class AuthorizationDialog(QDialog):
             if not activation_id or not user_code:
                 self.status_label.setText("授权服务器返回异常，缺少绑定码。")
                 return
-            state = AuthState.from_dict(self.app_window.auth_state.to_dict())
-            state.status = "pending"
-            state.activation_id = activation_id
-            state.user_code = user_code
-            state.device_hash = self.app_window.auth_device_hash
-            state.message = "等待 QQ 群绑定"
+            state = build_pending_activation_state(
+                self.app_window.auth_state,
+                activation_id,
+                user_code,
+                self.app_window.auth_device_hash,
+                message="等待 QQ 群绑定",
+            )
             self.app_window._apply_auth_state(state, persist=True)
             self._show_code(user_code, activation_id)
             self._refresh_binding_status_card()
@@ -1400,7 +1508,7 @@ class AuthorizationDialog(QDialog):
 
         status = str(data.get("status") or "")
         if data.get("authorized"):
-            now = float(data.get("server_time") or time.time())
+            server_time = float(data.get("server_time") or time.time())
             preserved_activation_id = str(getattr(self, "activation_id", "") or self.app_window.auth_state.activation_id or "")
             preserved_user_code = str(
                 data.get("user_code")
@@ -1415,11 +1523,11 @@ class AuthorizationDialog(QDialog):
                 device_hash=self.app_window.auth_device_hash,
                 qq_user_id_hash=str(data.get("qq_user_id_hash") or ""),
                 expires_at=float(data.get("expires_at") or 0),
-                last_checked_at=now,
                 activation_id=preserved_activation_id,
                 user_code=preserved_user_code,
                 message="授权成功",
             )
+            state.apply_check_timing(server_time)
             self.app_window._apply_auth_state(state, persist=True)
             self.app_window.auth_verified_this_session = True
             self.status_label.setText("授权成功，功能已解锁。")
@@ -1447,9 +1555,12 @@ class AuthorizationDialog(QDialog):
             self.instruction_label.setText("这个绑定码已经领取过授权，不能重复使用。请点击“生成绑定码”，再在指定 QQ 群发送新的 /bind 命令。")
             self.status_label.setText(message)
             self.copy_button.setEnabled(False)
-            self.start_button.setText("生成绑定码")
-            self.start_button.setEnabled(True)
-            self.start_button.setToolTip("")
+            self.generate_button.setVisible(True)
+            self.generate_button.setText("生成新绑定码")
+            self.generate_button.setEnabled(True)
+            self.generate_button.setToolTip("")
+            self.recheck_button.setVisible(False)
+            self.recheck_button.setEnabled(False)
             self.close_button.setText("稍后验证")
             self._refresh_binding_status_card()
             return
@@ -3486,6 +3597,11 @@ class AppWindow(QMainWindow):
         elif not self.auth_state.device_hash:
             self.auth_state.device_hash = self.auth_device_hash
         self.auth_verified_this_session = False
+        self.auth_manual_check_in_progress = False
+        self._last_auth_check_reason = "scheduled"
+        self._auth_dialog_dismissed_until = 0.0
+        self._auth_failure_toast_at = {}
+        self._last_auth_clock_skew_log_at = 0.0
         self.auth_check_worker = None
         self.auth_dialog = None
 
@@ -3614,17 +3730,57 @@ class AppWindow(QMainWindow):
     def _auth_is_allowed(self):
         return self._auth_decision().allowed
 
+    def _auth_clock_skew_warning(self, state=None):
+        state = state or self.auth_state
+        try:
+            skew = float(getattr(state, "clock_skew_seconds", 0) or 0)
+        except (TypeError, ValueError):
+            skew = 0.0
+        if abs(skew) <= AUTH_CLOCK_SKEW_WARNING_SECONDS:
+            return ""
+        direction = "快" if skew > 0 else "慢"
+        minutes = abs(skew) / 60.0
+        return f"检测到本机时间比服务器时间{direction}约 {minutes:.1f} 分钟，已按服务器时间基准判断授权；建议同步系统时间。"
+
+    def _auth_recovery_display_message(self, recovery, state=None):
+        state = state or self.auth_state
+        message = str(getattr(state, "message", "") or "").strip()
+        if message in ("授权有效", "授权成功") and getattr(recovery, "mode", "") != "authorized":
+            message = ""
+        warning = self._auth_clock_skew_warning(state)
+        if warning and getattr(recovery, "mode", "") in ("recheck_only", "transient_error"):
+            return warning
+        return message or str(getattr(recovery, "message", "") or "")
+
+    def _log_auth_clock_skew_if_needed(self, state=None):
+        state = state or self.auth_state
+        if str(getattr(state, "status", "") or "") != "authorized":
+            return
+        warning = self._auth_clock_skew_warning(state)
+        if not warning:
+            return
+        now = time.time()
+        if now - float(getattr(self, "_last_auth_clock_skew_log_at", 0) or 0) < 600:
+            return
+        self._last_auth_clock_skew_log_at = now
+        self.write_log(f"[来源验证] {warning}")
+
     def _auth_title_status(self):
         if not self._auth_required():
             return "验证关闭", "auth_offline", "来源验证未启用"
         decision = self._auth_decision()
         state = self.auth_state
-        detail = str(getattr(state, "message", "") or decision.message or "")
+        recovery = classify_auth_recovery(state)
+        detail = self._auth_recovery_display_message(recovery, state) or str(decision.message or "")
         fixed_policy = "在线复验固定 1 分钟一次；离线宽限固定 5 分钟。"
+        warning = self._auth_clock_skew_warning(state)
+        warning_part = f"{warning}" if warning else ""
+        if getattr(self, "auth_manual_check_in_progress", False):
+            return "复验中", "auth_offline", f"正在向授权服务器复验。{fixed_policy}"
         if decision.allowed:
             if self.auth_verified_this_session:
-                return "授权有效", "auth_ok", f"来源验证已通过。{fixed_policy}"
-            return "待复验", "auth_offline", f"本地授权缓存可用，正在等待在线复验。{fixed_policy}"
+                return "授权有效", "auth_ok", f"来源验证已通过。{fixed_policy}{warning_part}"
+            return "待复验", "auth_offline", f"本地授权缓存可用，正在等待在线复验。{fixed_policy}{warning_part}"
         if str(getattr(state, "status", "") or "") == "pending":
             return "待绑定", "auth_pending", f"绑定码已生成，请在指定 QQ 群完成 /bind。{fixed_policy}"
         return "未授权", "auth_bad", f"{detail or '需要完成来源验证'}。{fixed_policy}"
@@ -3652,7 +3808,7 @@ class AppWindow(QMainWindow):
         interval_ms = auth_check_interval_seconds(self.config) * 1000
         if timer is not None and timer.interval() != interval_ms:
             timer.setInterval(interval_ms)
-        self.start_authorization_check(silent=True)
+        self.start_authorization_check(silent=True, reason="scheduled")
 
     def _apply_auth_state(self, state, persist=False):
         self.auth_state = state if isinstance(state, AuthState) else AuthState.from_dict(state)
@@ -3660,17 +3816,23 @@ class AppWindow(QMainWindow):
             self.auth_state.device_hash = self.auth_device_hash
         if persist:
             save_auth_state(self.auth_state)
+        self._log_auth_clock_skew_if_needed(self.auth_state)
         self.update_primary_buttons()
         self._refresh_auth_title_button()
         dialog = getattr(self, "auth_dialog", None)
         if dialog is not None and dialog.isVisible() and hasattr(dialog, "refresh_auth_state_view"):
             dialog.refresh_auth_state_view()
 
-    def _show_authorization_dialog(self):
+    def mark_authorization_dialog_dismissed(self):
+        self._auth_dialog_dismissed_until = time.time() + 60
+
+    def _show_authorization_dialog(self, force=False, start_recheck=True):
         if not self._auth_required():
             return
-        if self.auth_state.access_token and (not self.auth_verified_this_session or not self._auth_decision().allowed):
-            self.start_authorization_check(silent=True)
+        if not force and time.time() < float(getattr(self, "_auth_dialog_dismissed_until", 0) or 0):
+            return
+        if start_recheck and self.auth_state.access_token and (not self.auth_verified_this_session or not self._auth_decision().allowed):
+            self.start_authorization_check(silent=True, reason="dialog")
         if self.auth_dialog is not None and self.auth_dialog.isVisible():
             self.auth_dialog.raise_()
             self.auth_dialog.activateWindow()
@@ -3689,7 +3851,7 @@ class AppWindow(QMainWindow):
             return True
         self.write_log(f"[来源验证] {action_label} 已拦截：{decision.message}")
         self.show_toast("请先完成来源验证", "warning")
-        self._show_authorization_dialog()
+        self._show_authorization_dialog(force=True, start_recheck=False)
         return False
 
     def _verify_authorization_now_for_action(self, action_label):
@@ -3705,11 +3867,13 @@ class AppWindow(QMainWindow):
             return False
         if not result.get("authorized"):
             state = AuthState.from_dict(self.auth_state.to_dict())
-            state.status = str(result.get("status") or "denied")
-            state.message = str(result.get("message") or "授权校验未通过")
-            self._apply_auth_state(state, persist=True)
+            recovery = classify_auth_recovery(self.auth_state, result, network_error=False)
+            if recovery.should_persist:
+                state.status = recovery.status
+            state.message = recovery.message or str(result.get("message") or "授权校验未通过")
+            self._apply_auth_state(state, persist=bool(recovery.should_persist))
             return False
-        now = float(result.get("server_time") or time.time())
+        server_time = float(result.get("server_time") or time.time())
         state = AuthState(
             status="authorized",
             access_token=self.auth_state.access_token,
@@ -3717,58 +3881,101 @@ class AppWindow(QMainWindow):
             device_hash=self.auth_device_hash,
             qq_user_id_hash=str(result.get("qq_user_id_hash") or self.auth_state.qq_user_id_hash or ""),
             expires_at=float(result.get("expires_at") or self.auth_state.expires_at or 0),
-            last_checked_at=now,
             activation_id=self.auth_state.activation_id,
             user_code=str(result.get("user_code") or self.auth_state.user_code or ""),
             message="授权有效",
         )
+        state.apply_check_timing(server_time)
         self.auth_verified_this_session = True
         self._apply_auth_state(state, persist=True)
         return True
 
-    def start_authorization_check(self, silent=True):
+    def start_authorization_check(self, silent=True, reason="scheduled"):
         if getattr(self, "_shutting_down", False):
             return
         if not self._auth_required():
             return
         if self.auth_check_worker is not None and self.auth_check_worker.isRunning():
             return
+        self._last_auth_check_reason = str(reason or "scheduled")
+        if self._last_auth_check_reason == "manual":
+            self.auth_manual_check_in_progress = True
+            self._refresh_auth_title_button()
         base_url = self._auth_base_url()
         if not self.auth_state.access_token:
+            self.auth_manual_check_in_progress = False
+            self._refresh_auth_title_button()
             if not silent:
-                self._show_authorization_dialog()
+                self._show_authorization_dialog(force=reason in ("manual", "action_gate"), start_recheck=False)
             return
         self.auth_check_worker = AuthCheckWorker(base_url, self.auth_state, self.auth_device_hash, self)
         self.auth_check_worker.completed.connect(self._handle_authorization_check_result)
         self.auth_check_worker.finished.connect(self.auth_check_worker.deleteLater)
         self.auth_check_worker.start()
 
-    def _handle_authorization_check_result(self, ok, state, message, network_error):
+    def _show_auth_failure_toast(self, message, tone="danger"):
+        key = str(message or "auth_failure")[:120]
+        now = time.time()
+        last = float(self._auth_failure_toast_at.get(key, 0) or 0)
+        if now - last < 60:
+            return
+        self._auth_failure_toast_at[key] = now
+        self.show_toast(message, tone)
+
+    def _handle_authorization_check_result(self, ok, state, message, network_error, result=None):
         if getattr(self, "_shutting_down", False):
             return
+        reason = str(getattr(self, "_last_auth_check_reason", "scheduled") or "scheduled")
+        self.auth_manual_check_in_progress = False
         self.auth_check_worker = None
+        result_token = str(getattr(state, "access_token", "") or "")
+        current_token = str(getattr(self.auth_state, "access_token", "") or "")
+        if result_token and result_token != current_token:
+            self.write_log("[来源验证] 已忽略过期授权复验结果。")
+            self._refresh_auth_title_button()
+            return
         if ok:
             self.auth_verified_this_session = True
             self._apply_auth_state(state, persist=True)
             self._refresh_auth_title_button()
             return
+        recovery = classify_auth_recovery(self.auth_state, result or {}, network_error=network_error)
         if network_error and self.auth_state.is_usable(time.time(), self._auth_offline_grace_seconds()):
             self.write_log(f"[来源验证] 在线复验失败，暂按离线宽限继续：{message}")
             self._refresh_auth_title_button()
             return
-        self._apply_auth_state(state, persist=True)
+        if recovery.should_persist:
+            updated = AuthState.from_dict(state.to_dict())
+            updated.status = recovery.status
+            updated.message = recovery.message or message
+            self._apply_auth_state(updated, persist=True)
+        else:
+            preserved = AuthState.from_dict(self.auth_state.to_dict())
+            preserved.message = recovery.message or message
+            self._apply_auth_state(preserved, persist=not network_error)
         self.auth_verified_this_session = False
-        self.write_log(f"[来源验证] 授权不可用：{message}")
+        diagnostic = result.get("diagnostic") if isinstance(result, dict) else {}
+        device_records = diagnostic.get("device_records") if isinstance(diagnostic, dict) else []
+        record_statuses = ",".join(str(item.get("status", "")) for item in device_records if isinstance(item, dict))
+        self.write_log(f"[来源验证] 授权不可用：status={recovery.status}, recovery={recovery.mode}, records={record_statuses}, message={recovery.message or message}")
         if self.sm.is_running:
             self.sm.stop()
             self.update_ui_on_stop()
-        self.show_toast("来源验证失败，功能已锁定", "danger")
-        self._show_authorization_dialog()
+            self._show_auth_failure_toast("来源验证失败，功能已锁定", "danger")
+        elif reason in ("manual", "action_gate"):
+            self._show_auth_failure_toast(recovery.message or "来源验证失败", "warning")
+        if should_show_authorization_dialog_after_check(
+            reason,
+            recovery.mode,
+            getattr(self, "_auth_dialog_dismissed_until", 0),
+            time.time(),
+        ):
+            self._show_authorization_dialog(force=reason in ("manual", "action_gate"), start_recheck=False)
 
     def show_authorization_status(self):
         if self.auth_state.access_token and (not self.auth_verified_this_session or not self.auth_state.user_code):
-            self.start_authorization_check(silent=True)
-        self._show_authorization_dialog()
+            self.start_authorization_check(silent=False, reason="manual")
+        self._show_authorization_dialog(force=True)
 
     def _monthly_card_reset_enabled(self):
         snapshot = getattr(self, "_settings_saved_snapshot", {}) or {}
@@ -4073,7 +4280,7 @@ class AppWindow(QMainWindow):
             return
         if self._auth_required():
             if self._auth_is_allowed():
-                self.start_authorization_check(silent=True)
+                self.start_authorization_check(silent=True, reason="startup")
             else:
                 self._show_authorization_dialog()
         self._schedule_update_check(initial=True)
@@ -5766,7 +5973,7 @@ class AppWindow(QMainWindow):
             self._set_settings_dirty(False)
             self.show_toast("高级设置已保存并应用", "success")
             self._check_monthly_card_daily_reset()
-            self.start_authorization_check(silent=True)
+            self.start_authorization_check(silent=True, reason="manual")
         else:
             self.show_toast("设置保存失败，请查看运行日志", "danger")
 

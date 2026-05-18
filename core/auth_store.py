@@ -9,6 +9,8 @@ from core.paths import writable_path
 
 
 AUTH_STORE_FILE = "auth_state.dat"
+AUTH_CLOCK_SKEW_WARNING_SECONDS = 5 * 60
+AUTH_CLOCK_ROLLBACK_TOLERANCE_SECONDS = 60
 
 
 @dataclass
@@ -20,6 +22,9 @@ class AuthState:
     qq_user_id_hash: str = ""
     expires_at: float = 0.0
     last_checked_at: float = 0.0
+    local_checked_at: float = 0.0
+    clock_skew_seconds: float = 0.0
+    monotonic_checked_at: float = 0.0
     activation_id: str = ""
     user_code: str = ""
     message: str = ""
@@ -40,23 +45,64 @@ class AuthState:
         state.message = str(state.message or "")
         state.expires_at = _as_float(state.expires_at)
         state.last_checked_at = _as_float(state.last_checked_at)
+        state.local_checked_at = _as_float(state.local_checked_at)
+        state.clock_skew_seconds = _as_float(state.clock_skew_seconds)
+        state.monotonic_checked_at = _as_float(state.monotonic_checked_at)
         return state
 
-    def to_dict(self):
-        return asdict(self)
+    def to_dict(self, include_runtime=True):
+        data = asdict(self)
+        if not include_runtime:
+            data.pop("monotonic_checked_at", None)
+        return data
 
-    def is_usable(self, now=None, offline_grace_seconds=0):
+    def apply_check_timing(self, server_time, local_time=None, monotonic_time=None):
+        server = _as_float(server_time) or time.time()
+        local = time.time() if local_time is None else _as_float(local_time)
+        monotonic = time.monotonic() if monotonic_time is None else _as_float(monotonic_time)
+        self.last_checked_at = server
+        self.local_checked_at = local
+        self.clock_skew_seconds = local - server
+        self.monotonic_checked_at = monotonic
+        return self
+
+    def _estimated_server_now(self, current, monotonic_now=None):
+        last_checked = float(self.last_checked_at or 0)
+        if last_checked <= 0:
+            return 0.0
+
+        monotonic_checked = float(self.monotonic_checked_at or 0)
+        if monotonic_checked > 0:
+            current_monotonic = time.monotonic() if monotonic_now is None else float(monotonic_now)
+            elapsed = current_monotonic - monotonic_checked
+            if elapsed < -1:
+                return 0.0
+            return last_checked + max(0.0, elapsed)
+
+        local_checked = float(self.local_checked_at or 0)
+        if local_checked > 0:
+            if current < local_checked - AUTH_CLOCK_ROLLBACK_TOLERANCE_SECONDS:
+                return 0.0
+            if abs(float(self.clock_skew_seconds or 0)) > AUTH_CLOCK_SKEW_WARNING_SECONDS:
+                return 0.0
+            return last_checked + max(0.0, current - local_checked)
+
+        if last_checked > current + AUTH_CLOCK_ROLLBACK_TOLERANCE_SECONDS:
+            return 0.0
+        return current
+
+    def is_usable(self, now=None, offline_grace_seconds=0, monotonic_now=None):
         current = time.time() if now is None else float(now)
         if self.status != "authorized" or not self.access_token:
             return False
-        if self.expires_at and current >= float(self.expires_at):
+        estimated_server_now = self._estimated_server_now(current, monotonic_now=monotonic_now)
+        if estimated_server_now <= 0:
             return False
-        if self.last_checked_at and float(self.last_checked_at) > current + 60:
+        if self.expires_at and estimated_server_now >= float(self.expires_at):
             return False
         grace = max(0.0, float(offline_grace_seconds or 0))
-        if grace <= 0:
-            return bool(self.last_checked_at and current <= float(self.last_checked_at) + 60)
-        return bool(self.last_checked_at and current <= float(self.last_checked_at) + grace)
+        allowed_window = grace if grace > 0 else 60.0
+        return bool(self.last_checked_at and estimated_server_now <= float(self.last_checked_at) + allowed_window)
 
 
 def _as_float(value):
@@ -96,7 +142,7 @@ def _unprotect_bytes(data, protected):
 def save_auth_state(state, path=None):
     target = Path(path) if path is not None else _default_store_path()
     target.parent.mkdir(parents=True, exist_ok=True)
-    raw = json.dumps(state.to_dict(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    raw = json.dumps(state.to_dict(include_runtime=False), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     protected, payload = _protect_bytes(raw)
     envelope = {
         "version": 1,
