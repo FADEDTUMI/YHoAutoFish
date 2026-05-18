@@ -1542,6 +1542,24 @@ class AuthorizationDialog(QDialog):
                 user_code=preserved_user_code,
                 message="授权成功",
             )
+            # Save license and refresh token from server response
+            license_blob = data.get("license")
+            if license_blob:
+                try:
+                    import json as _json
+                    from core.auth_license import save_license
+                    save_license(license_blob)
+                    state.license_data = _json.dumps(license_blob, ensure_ascii=False)
+                    state.license_expires_at = float(
+                        (license_blob.get("payload") or {}).get("expires_at")
+                        or data.get("expires_at") or 0
+                    )
+                except Exception:
+                    pass
+            refresh_tok = data.get("refresh_token")
+            if refresh_tok:
+                state.refresh_token = str(refresh_tok)
+                state.refresh_expires_at = float(data.get("refresh_expires_at") or 0)
             state.apply_check_timing(server_time)
             self.app_window._apply_auth_state(state, persist=True)
             self.app_window.auth_verified_this_session = True

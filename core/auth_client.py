@@ -372,10 +372,10 @@ class AuthClient:
             body["device_hash_v2"] = device_hash_v2
         if hw_ids:
             body["hw_ids"] = hw_ids
-        return self._request("POST", "/activation/start", body)
+        return self._request_with_failover("POST", "/activation/start", body)
 
     def poll_activation(self, activation_id, device_hash):
-        return self._request(
+        return self._request_with_failover(
             "POST",
             "/activation/poll",
             {
@@ -390,10 +390,10 @@ class AuthClient:
             body["device_hash_v2"] = device_hash_v2
         if hw_ids:
             body["hw_ids"] = hw_ids
-        return self._request("POST", "/entitlement/check", body, token=access_token)
+        return self._request_with_failover("POST", "/entitlement/check", body, token=access_token)
 
     def get_entitlement_status(self, access_token, device_hash):
-        return self._request(
+        return self._request_with_failover(
             "POST",
             "/entitlement/status",
             {"device_hash": device_hash},
@@ -423,7 +423,7 @@ class AuthClient:
         payload = {"device_hash": device_hash}
         if device_hash_v2:
             payload["device_hash_v2"] = device_hash_v2
-        return self._request("POST", "/token/refresh", payload, token=refresh_token)
+        return self._request_with_failover("POST", "/token/refresh", payload, token=refresh_token)
 
 
 def auth_config_required(config):
