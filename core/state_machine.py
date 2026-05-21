@@ -128,6 +128,16 @@ class StateMachine:
         else:
             print(msg)
 
+    def _throttled_log(self, key, msg, interval=1.0):
+        now = time.time()
+        store = getattr(self, "_log_throttle_store", None)
+        if store is None:
+            store = {}
+            self._log_throttle_store = store
+        if now - store.get(key, 0) >= interval:
+            store[key] = now
+            self._log(msg)
+
     def _should_stop(self):
         return bool(getattr(self, "_stop_requested", False) or not getattr(self, "is_running", False))
 
@@ -579,8 +589,19 @@ class StateMachine:
                         return
                     self._wait_after_cast(rect, 1.40)
                     return
-                self._log("[等待] 多次重试后仍停留在初始钓鱼界面，进入恢复流程。")
-                self._enter_recovering("多次重发 F 后仍未进入抛竿流程", record_empty=False, press_esc=False)
+                self._log(f"[等待] 已重试 {max_retries} 次仍停留在初始钓鱼界面，最后再做一次结算判定 (bypass 守门员)。")
+                success_info = self.result_det.detect_success_result(rect, bypass_guard=True)
+                if success_info and success_info.get("location"):
+                    s_conf = float(success_info.get("confidence") or 0.0)
+                    signals = self.result_det.format_success_signals(success_info)
+                    self._log(f"[等待] 最终判定命中成功结算 (置信度: {s_conf:.2f}, 信号: {signals})，转入结算流程。")
+                    self.result_det.finish_fast_success_result(rect, success_info, source_label="等待")
+                    return
+                failed_info = self.result_det.detect_fast_failed_result(rect)
+                if self.result_det.maybe_finish_failed_result(rect, failed_info, source_label="等待"):
+                    return
+                self._log("[等待] 最终结算判定未命中，疑似卡死在结算/初始界面之间，进入恢复流程并尝试 ESC 脱困。")
+                self._enter_recovering("多次重发 F 后仍未进入抛竿流程", record_empty=False, press_esc=True)
                 return
 
 

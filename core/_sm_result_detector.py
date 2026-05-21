@@ -74,8 +74,21 @@ class ResultDetector:
                     "roi": roi,
                 }
             if loc is not None:
+                tmpl_name = Path(matched_path).name if matched_path else "?"
+                self._sm._throttled_log(
+                    f"signal_hit_{kind}",
+                    f"[偵測] {kind} 命中: 信度 {conf:.2f}/{threshold:.2f} (策略={strategy}, 模板={tmpl_name})",
+                    interval=0.5,
+                )
                 return best
 
+        if best is not None:
+            tmpl_name = Path(best.get("template") or "").name or "?"
+            self._sm._throttled_log(
+                f"signal_miss_{kind}",
+                f"[偵測] {kind} 未達阈值: 最佳信度 {best['confidence']:.2f}/{threshold:.2f} (策略={best.get('strategy')}, 模板={tmpl_name})",
+                interval=1.0,
+            )
         return None
 
     def build_success_result_info(self, success_signals):
@@ -88,11 +101,79 @@ class ResultDetector:
             "signals": success_signals,
         }
 
+    def quick_settlement_signal_present(self, rect):
+        if self._sm.sc is None or not rect:
+            return None
+        probes = (
+            ("close-hint", self._sm.tpl.success_close_prompt_templates(), (0.22, 0.76, 0.56, 0.20), 0.66),
+            ("g-hint",     self._sm.tpl.weight_unit_templates(),          (0.30, 0.56, 0.42, 0.22), 0.62),
+            ("exp-hint",   self._sm.tpl.success_exp_templates(),          (0.24, 0.48, 0.52, 0.25), 0.58),
+        )
+        for tag, templates, roi, thresh in probes:
+            if not templates:
+                continue
+            img = self._sm.sc.capture_relative(rect, *roi)
+            if img is None:
+                continue
+            loc, conf, matched_path, strategy = self._sm.vis.find_best_template_multi_strategy(
+                img,
+                templates,
+                ({"name": f"{tag}-plain", "threshold": thresh},),
+                threshold=thresh,
+                scale_range=self._sm.tpl.scale_range(rect, 0.70, 1.40),
+                scale_steps=5,
+            )
+            if loc:
+                return {
+                    "tag": tag,
+                    "confidence": conf,
+                    "template": matched_path,
+                    "strategy": strategy,
+                }
+        return None
+
+    def initial_ui_blocks_result_detection(self, rect, threshold=0.88):
+        f_info = self._sm.cast_det.detect_initial_f_prompt_quick(rect, threshold=threshold)
+        if not f_info:
+            return False
+        cluster = self._sm.cast_det.detect_initial_control_cluster(rect)
+        f_conf = float(f_info.get("confidence") or 0.0)
+        if not (cluster and cluster.get("valid", False)):
+            cluster_count = int((cluster or {}).get("count") or 0)
+            self._sm._throttled_log(
+                "guard_pass",
+                f"[結算/守門員] F={f_conf:.2f} 但 cluster 未通過驗證(count={cluster_count}) → 放行偵測",
+                interval=1.0,
+            )
+            return False
+
+        settlement_hint = self.quick_settlement_signal_present(rect)
+        if settlement_hint:
+            tag = settlement_hint.get("tag", "?")
+            s_conf = float(settlement_hint.get("confidence") or 0.0)
+            tmpl_name = Path(settlement_hint.get("template") or "").name or "?"
+            self._sm._throttled_log(
+                "guard_bypass_settlement",
+                f"[結算/守門員] F+cluster 命中,但同步出現結算正面信號 {tag}={s_conf:.2f} ({tmpl_name}) → bypass 守門員",
+                interval=1.0,
+            )
+            return False
+
+        keys = "+".join(m.get("key", "?") for m in cluster.get("matches", [])) or "?"
+        self._sm._throttled_log(
+            "guard_block",
+            f"[結算/守門員] 判定為初始介面已跳過偵測: F={f_conf:.2f} cluster=valid({keys})",
+            interval=1.0,
+        )
+        return True
+
     # ------------------------------------------------------------------ #
     #  成功 / 失败检测（按速度分层）
     # ------------------------------------------------------------------ #
 
     def detect_ultrafast_success_result(self, rect):
+        if self.initial_ui_blocks_result_detection(rect, threshold=0.88):
+            return None
         close_info = self.match_result_signal(
             rect,
             "click close prompt",
@@ -101,14 +182,14 @@ class ResultDetector:
                 (0.22, 0.76, 0.56, 0.20),
             ),
             (
-                {"name": "close-ultra-edge", "threshold": 0.70, "use_edge": True, "early_accept": 0.92},
+                {"name": "close-ultra-plain", "threshold": 0.86, "early_accept": 0.94},
             ),
-            threshold=0.70,
+            threshold=0.86,
             low_factor=0.82,
             high_factor=1.24,
             scale_steps=5,
         )
-        if close_info and close_info.get("location") and close_info.get("confidence", 0.0) >= 0.84:
+        if close_info and close_info.get("location") and close_info.get("confidence", 0.0) >= 0.92:
             return self.build_success_result_info([close_info])
 
         exp_info = self.match_result_signal(
@@ -148,7 +229,7 @@ class ResultDetector:
         return None
 
     def detect_fast_success_result(self, rect, fast_only=False):
-        if self._sm._detect_initial_f_prompt_quick(rect, threshold=0.88):
+        if self.initial_ui_blocks_result_detection(rect, threshold=0.88):
             return None
         ultra_info = self.detect_ultrafast_success_result(rect)
         if ultra_info and ultra_info.get("location"):
@@ -165,10 +246,9 @@ class ResultDetector:
                 (0.18, 0.74, 0.64, 0.24),
             ),
             (
-                {"name": "close-fast-edge", "threshold": 0.66, "use_edge": True},
-                {"name": "close-fast-plain", "threshold": 0.74},
+                {"name": "close-fast-plain", "threshold": 0.82},
             ),
-            threshold=0.66,
+            threshold=0.82,
             low_factor=0.62,
             high_factor=1.50,
             scale_steps=11,
@@ -240,8 +320,8 @@ class ResultDetector:
             scale_steps=5,
         )
 
-    def detect_success_result(self, rect):
-        if self._sm._detect_initial_f_prompt_quick(rect, threshold=0.88):
+    def detect_success_result(self, rect, bypass_guard=False):
+        if not bypass_guard and self.initial_ui_blocks_result_detection(rect, threshold=0.88):
             return None
 
         success_signals = []
@@ -278,10 +358,9 @@ class ResultDetector:
                 (0.30, 0.82, 0.40, 0.14),
             ),
             (
-                {"name": "close-edge", "threshold": 0.50, "use_edge": True},
-                {"name": "close-plain", "threshold": 0.62},
+                {"name": "close-plain", "threshold": 0.78},
             ),
-            threshold=0.60,
+            threshold=0.78,
             low_factor=0.52,
             high_factor=1.80,
             scale_steps=17,
