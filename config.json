@@ -29,7 +29,7 @@
     "debug_mode": true,
     "auto_sell_catch_threshold": 500,
     "monthly_card_daily_reset_enabled": true,
-    "monthly_card_daily_reset_last_date": "2026-05-05",
+    "monthly_card_daily_reset_last_date": "2026-05-19",
     "sponsor_button_hidden": false,
     "sponsor_qr_dir": "sponsor_qr"
 }

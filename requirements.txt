@@ -11,3 +11,4 @@ onnxruntime>=1.17.0
 rapidocr>=3.0.0
 matplotlib>=3.7.0
 pillow>=10.0.0
+websocket-client>=1.6.0

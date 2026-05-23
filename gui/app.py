@@ -1,4 +1,4 @@
-﻿import html
+import html
 import json
 import os
 import queue
@@ -34,18 +34,22 @@ from PySide6.QtWidgets import (
 from core.auth_client import (
     AuthClient,
     AuthClientError,
+    _process_hosts_update,
     auth_check_interval_seconds,
     auth_config_required,
     auth_offline_grace_seconds,
     build_pending_activation_state,
     classify_auth_recovery,
+    decode_jwt_payload,
     decide_cached_authorization,
     should_persist_auth_failure,
     should_show_authorization_dialog_after_check,
 )
-from core.auth_device import build_device_hash, get_or_create_install_id
-from core.auth_policy import get_auth_base_url
+from core.auth_device import build_device_hash, build_device_hash_v2, get_or_create_install_id
+from core.auth_license import LICENSE_GRACE_DAYS
+from core.auth_policy import get_auth_base_url, get_effective_hosts, is_ip_host, update_remote_hosts
 from core.auth_store import AUTH_CLOCK_SKEW_WARNING_SECONDS, AuthState, load_auth_state, save_auth_state
+from core.auth_ws import AuthWSWorker
 from core.paths import ensure_writable_file, resource_path
 from core.monthly_card_reset import (
     CONFIG_KEY_ENABLED as MONTHLY_CARD_RESET_ENABLED_KEY,
@@ -913,18 +917,19 @@ class UpdateDownloadWorker(QThread):
 class AuthCheckWorker(QThread):
     completed = Signal(bool, object, str, bool, object)
 
-    def __init__(self, base_url, state, device_hash, parent=None):
+    def __init__(self, base_url, state, device_hash, device_hash_v2="", parent=None):
         super().__init__(parent)
         self.base_url = base_url
         self.state = state
         self.device_hash = device_hash
+        self.device_hash_v2 = device_hash_v2
 
     def run(self):
         if not self.state.access_token:
             self.completed.emit(False, self.state, "尚未绑定授权", False)
             return
         try:
-            result = AuthClient(self.base_url, timeout=8).check_entitlement(self.state.access_token, self.device_hash)
+            result = AuthClient(self.base_url, timeout=8).check_entitlement(self.state.access_token, self.device_hash, device_hash_v2=self.device_hash_v2)
             if self.isInterruptionRequested():
                 return
             if result.get("authorized"):
@@ -934,17 +939,209 @@ class AuthCheckWorker(QThread):
                     access_token=self.state.access_token,
                     license_id=str(result.get("license_id") or self.state.license_id or ""),
                     device_hash=self.device_hash,
+                    device_hash_v2=self.device_hash_v2,
                     qq_user_id_hash=str(result.get("qq_user_id_hash") or self.state.qq_user_id_hash or ""),
                     expires_at=float(result.get("expires_at") or self.state.expires_at or 0),
                     activation_id=self.state.activation_id,
                     user_code=str(result.get("user_code") or self.state.user_code or ""),
                     message="授权有效",
+                    refresh_token=self.state.refresh_token,
+                    refresh_expires_at=self.state.refresh_expires_at,
+                    license_data=self.state.license_data,
+                    license_expires_at=float(result.get("license_expires_at") or self.state.license_expires_at or 0),
                 )
                 updated.apply_check_timing(server_time)
                 self.completed.emit(True, updated, "授权有效", False, result)
                 return
             updated = AuthState.from_dict(self.state.to_dict())
+            # Try refresh_token if available and not expired
+            if self.state.refresh_token and (not self.state.refresh_expires_at or time.time() < self.state.refresh_expires_at):
+                try:
+                    refresh_result = AuthClient(self.base_url, timeout=8).refresh_access_token(
+                        self.state.refresh_token,
+                        device_hash_v2=self.device_hash_v2,
+                        device_hash=self.device_hash,
+                    )
+                    if refresh_result.get("status") == "authorized" and refresh_result.get("access_token"):
+                        new_token = refresh_result["access_token"]
+                        retry_result = AuthClient(self.base_url, timeout=8).check_entitlement(new_token, self.device_hash, device_hash_v2=self.device_hash_v2)
+                        if retry_result.get("authorized"):
+                            server_time = float(retry_result.get("server_time") or time.time())
+                            updated = AuthState(
+                                status="authorized",
+                                access_token=new_token,
+                                license_id=str(retry_result.get("license_id") or self.state.license_id or ""),
+                                device_hash=self.device_hash,
+                                device_hash_v2=self.device_hash_v2,
+                                qq_user_id_hash=str(retry_result.get("qq_user_id_hash") or self.state.qq_user_id_hash or ""),
+                                expires_at=float(retry_result.get("expires_at") or 0),
+                                activation_id=self.state.activation_id,
+                                user_code=str(retry_result.get("user_code") or self.state.user_code or ""),
+                                message="授权有效（token 已刷新）",
+                                refresh_token=str(refresh_result.get("refresh_token") or self.state.refresh_token),
+                                refresh_expires_at=float(refresh_result.get("refresh_expires_at") or self.state.refresh_expires_at or 0),
+                                license_data=self.state.license_data,
+                                license_expires_at=float(retry_result.get("license_expires_at") or self.state.license_expires_at or 0),
+                            )
+                            updated.apply_check_timing(server_time)
+                            # V1→V2 migration: detect JWT in refresh response
+                            if refresh_result.get("jwt_token"):
+                                updated.jwt_token = str(refresh_result["jwt_token"])
+                                updated.jwt_expires_at = float(refresh_result.get("jwt_expires_at", 0))
+                                updated.jwt_issued_monotonic = time.monotonic()
+                                updated.protocol_version = 2
+                            self.completed.emit(True, updated, "授权有效（token 已刷新）", False, retry_result)
+                            return
+                except Exception as refresh_exc:
+                    print(f"[auth] refresh_token 恢复失败: {refresh_exc}")
+            # Step 3: Try reactivate if we have qq_user_id_hash (30+ day gap recovery)
+            if self.state.qq_user_id_hash:
+                try:
+                    reactivate_result = AuthClient(self.base_url, timeout=8).reactivate_entitlement(
+                        self.state.qq_user_id_hash, self.device_hash, device_hash_v2=self.device_hash_v2)
+                    if reactivate_result.get("status") == "authorized" and reactivate_result.get("access_token"):
+                        new_token = reactivate_result["access_token"]
+                        retry_result = AuthClient(self.base_url, timeout=8).check_entitlement(new_token, self.device_hash, device_hash_v2=self.device_hash_v2)
+                        if retry_result.get("authorized"):
+                            server_time = float(retry_result.get("server_time") or time.time())
+                            updated = AuthState(
+                                status="authorized",
+                                access_token=new_token,
+                                license_id=str(retry_result.get("license_id") or self.state.license_id or ""),
+                                device_hash=self.device_hash,
+                                device_hash_v2=self.device_hash_v2,
+                                qq_user_id_hash=str(retry_result.get("qq_user_id_hash") or self.state.qq_user_id_hash or ""),
+                                expires_at=float(retry_result.get("expires_at") or 0),
+                                activation_id=self.state.activation_id,
+                                user_code=str(retry_result.get("user_code") or self.state.user_code or ""),
+                                message="授权有效（已自动恢复）",
+                                refresh_token=str(reactivate_result.get("refresh_token") or ""),
+                                refresh_expires_at=float(reactivate_result.get("refresh_expires_at") or 0),
+                                license_data=self.state.license_data,
+                                license_expires_at=float(retry_result.get("license_expires_at") or self.state.license_expires_at or 0),
+                            )
+                            updated.apply_check_timing(server_time)
+                            self.completed.emit(True, updated, "授权有效（已自动恢复）", False, retry_result)
+                            return
+                except Exception as reactivate_exc:
+                    print(f"[auth] reactivate 恢复失败: {reactivate_exc}")
             recovery = classify_auth_recovery(self.state, result, network_error=False)
+            if recovery.should_persist:
+                updated.status = recovery.status
+            updated.message = recovery.message or str(result.get("message") or "授权校验未通过")
+            self.completed.emit(False, updated, updated.message, False, result)
+        except Exception as exc:
+            if not self.isInterruptionRequested():
+                self.completed.emit(False, self.state, f"授权服务器连接失败: {exc}", True, {})
+
+
+class AuthCheckWorkerV2(QThread):
+    """V2 auth check worker with 3-step recovery using JWT-based endpoints."""
+
+    completed = Signal(bool, object, str, bool, object)
+
+    def __init__(self, base_url, state, device_hash, device_hash_v2="", parent=None):
+        super().__init__(parent)
+        self.base_url = base_url
+        self.state = state
+        self.device_hash = device_hash
+        self.device_hash_v2 = device_hash_v2
+
+    def _build_authorized_state(self, result, jwt_token, refresh_token="", refresh_expires_at=0.0):
+        server_time = float(result.get("server_time") or time.time())
+        # Use fresh JWT from server response if available (auto-renewal)
+        fresh_jwt = str(result.get("jwt_token") or jwt_token or "")
+        fresh_exp = float(result.get("jwt_expires_at") or result.get("expires_at") or 0)
+        updated = AuthState(
+            status="authorized",
+            access_token=fresh_jwt,
+            license_id=str(result.get("license_id") or self.state.license_id or ""),
+            device_hash=self.device_hash,
+            device_hash_v2=self.device_hash_v2,
+            qq_user_id_hash=str(result.get("qq_user_id_hash") or self.state.qq_user_id_hash or ""),
+            expires_at=fresh_exp,
+            activation_id=self.state.activation_id,
+            user_code=str(result.get("user_code") or self.state.user_code or ""),
+            message="授权有效",
+            refresh_token=str(refresh_token or self.state.refresh_token or ""),
+            refresh_expires_at=float(refresh_expires_at or self.state.refresh_expires_at or 0),
+            license_data=self.state.license_data,
+            license_expires_at=float(result.get("license_expires_at") or self.state.license_expires_at or 0),
+            jwt_token=fresh_jwt,
+            jwt_expires_at=fresh_exp,
+            jwt_issued_monotonic=time.monotonic(),
+            protocol_version=2,
+        )
+        updated.apply_check_timing(server_time)
+        return updated
+
+    def run(self):
+        if not self.state.jwt_token:
+            self.completed.emit(False, self.state, "V2 协议缺少 JWT", False, {})
+            return
+        try:
+            # Step 1: check_entitlement_v2
+            result = AuthClient(self.base_url, timeout=8).check_entitlement_v2(
+                self.state.jwt_token, self.device_hash, device_hash_v2=self.device_hash_v2)
+            if self.isInterruptionRequested():
+                return
+            if result.get("authorized"):
+                updated = self._build_authorized_state(result, self.state.jwt_token)
+                self.completed.emit(True, updated, "授权有效", False, result)
+                return
+
+            # Step 2: refresh_token_v2
+            if self.state.refresh_token and (not self.state.refresh_expires_at or time.time() < self.state.refresh_expires_at):
+                try:
+                    refresh_result = AuthClient(self.base_url, timeout=8).refresh_token_v2(
+                        self.state.refresh_token, device_hash_v2=self.device_hash_v2, device_hash=self.device_hash)
+                    if self.isInterruptionRequested():
+                        return
+                    refresh_status = refresh_result.get("status", "")
+                    has_access = bool(refresh_result.get("access_token"))
+                    print(f"[auth-v2] refresh result: status={refresh_status}, has_access_token={has_access}")
+                    if refresh_status == "authorized" and has_access:
+                        new_jwt = refresh_result["access_token"]
+                        retry_result = AuthClient(self.base_url, timeout=8).check_entitlement_v2(
+                            new_jwt, self.device_hash, device_hash_v2=self.device_hash_v2)
+                        if retry_result.get("authorized"):
+                            updated = self._build_authorized_state(
+                                retry_result, new_jwt,
+                                refresh_token=str(refresh_result.get("refresh_token") or ""),
+                                refresh_expires_at=float(refresh_result.get("refresh_expires_at") or 0))
+                            updated.message = "授权有效（token 已刷新）"
+                            self.completed.emit(True, updated, "授权有效（token 已刷新）", False, retry_result)
+                            return
+                    else:
+                        print(f"[auth-v2] refresh 失败: status={refresh_status}, msg={refresh_result.get('message', '')}")
+                except Exception as refresh_exc:
+                    print(f"[auth-v2] refresh_token_v2 恢复异常: {refresh_exc}")
+
+            # Step 3: reactivate_entitlement_v2
+            if self.state.qq_user_id_hash:
+                try:
+                    reactivate_result = AuthClient(self.base_url, timeout=8).reactivate_entitlement_v2(
+                        self.state.qq_user_id_hash, self.device_hash, device_hash_v2=self.device_hash_v2)
+                    if self.isInterruptionRequested():
+                        return
+                    if reactivate_result.get("status") == "authorized" and reactivate_result.get("access_token"):
+                        new_jwt = reactivate_result["access_token"]
+                        retry_result = AuthClient(self.base_url, timeout=8).check_entitlement_v2(
+                            new_jwt, self.device_hash, device_hash_v2=self.device_hash_v2)
+                        if retry_result.get("authorized"):
+                            updated = self._build_authorized_state(
+                                retry_result, new_jwt,
+                                refresh_token=str(reactivate_result.get("refresh_token") or ""),
+                                refresh_expires_at=float(reactivate_result.get("refresh_expires_at") or 0))
+                            updated.message = "授权有效（已自动恢复）"
+                            self.completed.emit(True, updated, "授权有效（已自动恢复）", False, retry_result)
+                            return
+                except Exception as reactivate_exc:
+                    print(f"[auth-v2] reactivate_v2 恢复失败: {reactivate_exc}")
+
+            # All recovery steps failed
+            recovery = classify_auth_recovery(self.state, result, network_error=False)
+            updated = AuthState.from_dict(self.state.to_dict())
             if recovery.should_persist:
                 updated.status = recovery.status
             updated.message = recovery.message or str(result.get("message") or "授权校验未通过")
@@ -957,7 +1154,7 @@ class AuthCheckWorker(QThread):
 class AuthActivationWorker(QThread):
     completed = Signal(str, bool, object, str)
 
-    def __init__(self, action, base_url, device_hash, install_id, app_version, activation_id="", parent=None):
+    def __init__(self, action, base_url, device_hash, install_id, app_version, activation_id="", device_hash_v2="", parent=None):
         super().__init__(parent)
         self.action = action
         self.base_url = base_url
@@ -965,12 +1162,13 @@ class AuthActivationWorker(QThread):
         self.install_id = install_id
         self.app_version = app_version
         self.activation_id = activation_id
+        self.device_hash_v2 = device_hash_v2
 
     def run(self):
         try:
             client = AuthClient(self.base_url, timeout=8)
             if self.action == "start":
-                data = client.start_activation(self.device_hash, self.install_id, self.app_version)
+                data = client.start_activation(self.device_hash, self.install_id, self.app_version, device_hash_v2=self.device_hash_v2)
             else:
                 data = client.poll_activation(self.activation_id, self.device_hash)
             if not self.isInterruptionRequested():
@@ -1150,13 +1348,19 @@ class AuthorizationDialog(QDialog):
         layout.addLayout(actions)
 
         self.refresh_auth_state_view()
-        self.refresh_groups()
+        cached = getattr(self.app_window, '_cached_groups', None)
+        cached_at = getattr(self.app_window, '_cached_groups_at', 0)
+        if cached and (time.time() - cached_at < 300):
+            self._render_groups(cached, "")
+        else:
+            self.refresh_groups()
 
     def closeEvent(self, event):
         self.poll_timer.stop()
         self._stop_worker()
         self._stop_group_worker()
-        super().closeEvent(event)
+        event.ignore()
+        self.hide()
 
     def reject(self):
         self.poll_timer.stop()
@@ -1164,7 +1368,7 @@ class AuthorizationDialog(QDialog):
         self._stop_group_worker()
         if hasattr(self.app_window, "mark_authorization_dialog_dismissed"):
             self.app_window.mark_authorization_dialog_dismissed()
-        super().reject()
+        self.hide()
 
     def _stop_worker(self):
         worker = self.worker
@@ -1174,7 +1378,7 @@ class AuthorizationDialog(QDialog):
             if worker.isRunning():
                 worker.requestInterruption()
                 worker.quit()
-                worker.wait(800)
+                worker.finished.connect(lambda w=worker: w.deleteLater())
         except RuntimeError:
             pass
         self.worker = None
@@ -1187,7 +1391,7 @@ class AuthorizationDialog(QDialog):
             if worker.isRunning():
                 worker.requestInterruption()
                 worker.quit()
-                worker.wait(800)
+                worker.finished.connect(lambda w=worker: w.deleteLater())
         except RuntimeError:
             pass
         self.group_worker = None
@@ -1209,7 +1413,7 @@ class AuthorizationDialog(QDialog):
             code_part = f"已绑定的绑定码：{code}。" if code else "正在从服务器同步绑定码。"
         else:
             code_part = f"当前绑定码：{code}。" if code else "当前没有待绑定的绑定码。"
-        return f"绑定状态：{title_text}。{code_part}在线复验固定 1 分钟一次，离线宽限固定 5 分钟。{tooltip}"
+        return f"绑定状态：{title_text}。{code_part}在线复验固定 5 分钟一次，离线宽限 14 天。{tooltip}"
 
     def _refresh_binding_status_card(self):
         if hasattr(self, "binding_status_card"):
@@ -1221,6 +1425,22 @@ class AuthorizationDialog(QDialog):
         activation_id = str(getattr(state, "activation_id", "") or "").strip()
         recovery = classify_auth_recovery(state)
         if self.app_window._auth_decision().allowed:
+            # If allowed but no access_token (license-only fallback), show rebind option
+            if not state.access_token and not state.jwt_token:
+                recovery = classify_auth_recovery(state)
+                if recovery.mode == "can_rebind":
+                    self.poll_timer.stop()
+                    self._bound_mode = False
+                    self.generate_button.setVisible(True)
+                    self.generate_button.setText("生成新绑定码")
+                    self.generate_button.setEnabled(True)
+                    self.recheck_button.setVisible(False)
+                    self.code_label.setText("离线授权有效，但需要联网绑定以启用完整功能。")
+                    self.instruction_label.setText("请点击下方按钮生成绑定码，在 QQ 群内完成绑定。")
+                    self.status_label.setText("离线授权有效")
+                    self.close_button.setText("稍后处理")
+                    self._refresh_binding_status_card()
+                    return
             self._show_bound_code(code)
             return
         if recovery.mode == "pending_activation" and activation_id and code:
@@ -1334,13 +1554,22 @@ class AuthorizationDialog(QDialog):
         else:
             status_text = "授权有效，正在从服务器同步绑定码。同步完成后可复制。" + (f" {warning}" if warning else "")
         auth_state = self.app_window.auth_state
-        if getattr(auth_state, "expires_at", 0) > 0:
-            remaining = float(auth_state.expires_at) - time.time()
+        if getattr(auth_state, "license_expires_at", 0) > 0:
+            remaining = float(auth_state.license_expires_at) - time.time()
             if remaining > 0:
-                days = int(remaining / 86400)
-                status_text += f"\n离线授权有效期剩余: {days} 天"
+                hours = int(remaining / 3600)
+                if hours >= 24:
+                    status_text += f"\n离线授权剩余 {hours // 24} 天。"
+                else:
+                    status_text += f"\n离线授权剩余 {hours} 小时。"
             else:
-                status_text += "\n离线授权已过期，请联网续期"
+                grace_deadline = float(auth_state.license_expires_at) + LICENSE_GRACE_DAYS * 86400
+                grace_remaining = grace_deadline - time.time()
+                if grace_remaining > 0:
+                    grace_days = int(grace_remaining / 86400)
+                    status_text += f"\n离线授权已过期，宽限期剩余 {grace_days} 天，请联网续期。"
+                else:
+                    status_text += "\n离线授权已过期，请联网续期。"
         self.status_label.setText(status_text)
         self.copy_button.setEnabled(bool(self.current_user_code))
         self.generate_button.setVisible(False)
@@ -1389,6 +1618,8 @@ class AuthorizationDialog(QDialog):
             return
         groups = data.get("groups") if isinstance(data, dict) else []
         self._render_groups(groups or [], "服务器暂未公开群入口，请稍后再试。")
+        self.app_window._cached_groups = groups or []
+        self.app_window._cached_groups_at = time.time()
 
     def _render_groups(self, groups, empty_text):
         while self.group_layout.count():
@@ -1470,6 +1701,7 @@ class AuthorizationDialog(QDialog):
             self.app_window.auth_device_hash,
             self.app_window.auth_install_id,
             APP_VERSION,
+            device_hash_v2=self.app_window.auth_device_hash_v2,
             parent=self,
         )
         self.worker.completed.connect(self._handle_worker_result)
@@ -1490,6 +1722,7 @@ class AuthorizationDialog(QDialog):
             self.app_window.auth_install_id,
             APP_VERSION,
             activation_id=activation_id,
+            device_hash_v2=self.app_window.auth_device_hash_v2,
             parent=self,
         )
         self.worker.completed.connect(self._handle_worker_result)
@@ -1548,7 +1781,7 @@ class AuthorizationDialog(QDialog):
                 try:
                     import json as _json
                     from core.auth_license import save_license
-                    save_license(license_blob)
+                    QTimer.singleShot(0, lambda lb=license_blob: save_license(lb))
                     state.license_data = _json.dumps(license_blob, ensure_ascii=False)
                     state.license_expires_at = float(
                         (license_blob.get("payload") or {}).get("expires_at")
@@ -1902,7 +2135,7 @@ class QQGroupDialog(QDialog):
             if worker.isRunning():
                 worker.requestInterruption()
                 worker.quit()
-                worker.wait(800)
+                worker.finished.connect(lambda w=worker: w.deleteLater())
         except RuntimeError:
             pass
         self.group_worker = None
@@ -3623,12 +3856,42 @@ class AppWindow(QMainWindow):
         self._monthly_card_reset_in_progress = False
         self.auth_install_id = get_or_create_install_id()
         self.auth_device_hash = build_device_hash(self.auth_install_id)
+        self.auth_device_hash_v2 = build_device_hash_v2()
         self.auth_state = load_auth_state()
         if self.auth_state.device_hash and self.auth_state.device_hash != self.auth_device_hash:
             self.auth_state = AuthState(status="unknown", device_hash=self.auth_device_hash, message="设备指纹已变化")
             save_auth_state(self.auth_state)
         elif not self.auth_state.device_hash:
             self.auth_state.device_hash = self.auth_device_hash
+        # Restore cached remote hosts from previous session.
+        # Note: cached_hosts was ECDSA-verified when first received from the server.
+        # Re-restoration skips re-verification — acceptable because auth_state.dat is
+        # DPAPI-protected (machine-bound), default hosts always take priority, and
+        # TLS certificate validation provides an additional safety net.
+        if self.auth_state.cached_hosts:
+            try:
+                cached = json.loads(self.auth_state.cached_hosts)
+                if isinstance(cached, list) and cached:
+                    update_remote_hosts(cached)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        # Populate license_expires_at from license file if not already set
+        if not self.auth_state.license_expires_at:
+            try:
+                from core.auth_license import load_license
+                license_blob = load_license()
+                if license_blob:
+                    payload = license_blob.get("payload") or {}
+                    exp = float(payload.get("expires_at") or 0)
+                    if exp > 0:
+                        self.auth_state.license_expires_at = exp
+                        self.write_log(f"[授权] 从 license 文件加载过期时间: {exp} (剩余 {int((exp - time.time()) / 86400)} 天)")
+                    else:
+                        self.write_log(f"[授权] license 文件 payload 无 expires_at: {list(payload.keys())}")
+                else:
+                    self.write_log("[授权] license 文件不存在或无法加载")
+            except Exception as exc:
+                self.write_log(f"[授权] 加载 license 文件异常: {exc}")
         self.auth_verified_this_session = False
         self.auth_manual_check_in_progress = False
         self._last_auth_check_reason = "scheduled"
@@ -3637,13 +3900,17 @@ class AppWindow(QMainWindow):
         self._last_auth_clock_skew_log_at = 0.0
         self.auth_check_worker = None
         self.auth_dialog = None
+        self._cached_groups = None
+        self._cached_groups_at = 0
+        self.auth_ws_worker = None
+        self._ws_status = "disconnected"
 
         self.init_ui()
         self._sync_runtime_preferences()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.process_queue)
-        self.timer.start(60)
+        self.timer.start(100)
 
         self.monthly_card_reset_timer = QTimer(self)
         self.monthly_card_reset_timer.setTimerType(Qt.CoarseTimer)
@@ -3662,6 +3929,10 @@ class AppWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self.shutdown_background_tasks)
+
+        # Start WebSocket worker for V2 protocol real-time revocation push
+        if getattr(self.auth_state, 'protocol_version', 1) >= 2 and self.auth_state.jwt_token:
+            QTimer.singleShot(2000, self._start_websocket_worker)
 
     def load_config(self):
         if not os.path.exists(CONFIG_FILE):
@@ -3805,25 +4076,119 @@ class AppWindow(QMainWindow):
         state = self.auth_state
         recovery = classify_auth_recovery(state)
         detail = self._auth_recovery_display_message(recovery, state) or str(decision.message or "")
-        fixed_policy = "在线复验固定 1 分钟一次；离线宽限固定 5 分钟。"
+        fixed_policy = "在线复验固定 5 分钟一次；离线宽限 12 小时。"
         warning = self._auth_clock_skew_warning(state)
         warning_part = f"{warning}" if warning else ""
         if getattr(self, "auth_manual_check_in_progress", False):
             return "复验中", "auth_offline", f"正在向授权服务器复验。{fixed_policy}"
         if decision.allowed:
             if self.auth_verified_this_session:
-                return "授权有效", "auth_ok", f"来源验证已通过。{fixed_policy}{warning_part}"
+                license_info = ""
+                if getattr(state, "license_expires_at", 0) > 0:
+                    remaining = float(state.license_expires_at) - time.time()
+                    if remaining > 0:
+                        hours = int(remaining / 3600)
+                        if hours >= 24:
+                            license_info = f"离线授权剩余 {hours // 24} 天。"
+                        else:
+                            license_info = f"离线授权剩余 {hours} 小时。"
+                    else:
+                        grace_deadline = float(state.license_expires_at) + LICENSE_GRACE_DAYS * 86400
+                        grace_remaining = grace_deadline - time.time()
+                        if grace_remaining > 0:
+                            license_info = f"离线授权已过期，宽限期剩余 {int(grace_remaining / 86400)} 天。"
+                        else:
+                            license_info = "离线授权已过期。"
+                return "授权有效", "auth_ok", f"来源验证已通过。{license_info}{fixed_policy}{warning_part}"
             license_info = ""
-            if getattr(state, "expires_at", 0) > 0:
-                remaining = float(state.expires_at) - time.time()
+            if getattr(state, "license_expires_at", 0) > 0:
+                remaining = float(state.license_expires_at) - time.time()
                 if remaining > 0:
                     license_info = f"离线授权剩余 {int(remaining / 86400)} 天。"
                 else:
-                    license_info = "离线授权已过期。"
+                    grace_deadline = float(state.license_expires_at) + LICENSE_GRACE_DAYS * 86400
+                    grace_remaining = grace_deadline - time.time()
+                    if grace_remaining > 0:
+                        license_info = f"离线授权已过期，宽限期剩余 {int(grace_remaining / 86400)} 天。"
+                    else:
+                        license_info = "离线授权已过期。"
             return "待复验", "auth_offline", f"{license_info}本地授权缓存可用，正在等待在线复验。{fixed_policy}{warning_part}"
         if str(getattr(state, "status", "") or "") == "pending":
             return "待绑定", "auth_pending", f"绑定码已生成，请在指定 QQ 群完成 /bind。{fixed_policy}"
         return "未授权", "auth_bad", f"{detail or '需要完成来源验证'}。{fixed_policy}"
+
+    # ---- WebSocket integration for V2 real-time revocation ----
+
+    def _build_ws_url(self):
+        """Build WSS URL from effective auth hosts. Prefer domain names over IPs."""
+        from core.auth_policy import get_effective_hosts, is_ip_host
+        hosts = get_effective_hosts()
+        # Prefer non-IP hosts (domains work through Cloudflare Tunnel)
+        for host in hosts:
+            if not is_ip_host(host):
+                return f"wss://{host}/ws/auth"
+        # Fallback to first host
+        if hosts:
+            return f"wss://{hosts[0]}/ws/auth"
+        return ""
+
+    def _start_websocket_worker(self):
+        """Start WebSocket worker for real-time revocation push."""
+        if getattr(self, "_shutting_down", False):
+            return
+        if self.auth_ws_worker is not None and self.auth_ws_worker.isRunning():
+            return
+        if not self.auth_state.jwt_token:
+            return
+        license_id = str(getattr(self.auth_state, "license_id", "") or "")
+        if not license_id:
+            return
+        ws_url = self._build_ws_url()
+        if not ws_url:
+            return
+        self.auth_ws_worker = AuthWSWorker(ws_url, self.auth_state.jwt_token, license_id, parent=self)
+        self.auth_ws_worker.revoked.connect(self._handle_ws_revocation)
+        self.auth_ws_worker.status_changed.connect(self._handle_ws_status_change)
+        self.auth_ws_worker.finished.connect(self.auth_ws_worker.deleteLater)
+        self.auth_ws_worker.start()
+        self.write_log("[auth-ws] WebSocket 工作线程已启动")
+
+    def _handle_ws_revocation(self, license_id, reason):
+        """Handle real-time revocation push from server."""
+        self.write_log(f"[auth-ws] 收到吊销推送: license={license_id}, reason={reason}")
+        state = AuthState.from_dict(self.auth_state.to_dict())
+        state.status = "revoked"
+        state.message = f"授权已被吊销: {reason}"
+        self._apply_auth_state(state, persist=True)
+        self._stop_websocket_worker()
+        self._show_auth_failure_toast(f"授权已被吊销: {reason}", "danger")
+        if self.sm.is_running:
+            self.sm.stop()
+            self.update_ui_on_stop()
+
+    def _handle_ws_status_change(self, status):
+        """Handle WebSocket connection status change."""
+        self._ws_status = str(status or "disconnected")
+        self._refresh_auth_title_button()
+
+    def _stop_websocket_worker(self):
+        """Stop WebSocket worker gracefully."""
+        worker = getattr(self, "auth_ws_worker", None)
+        if worker is None:
+            return
+        try:
+            if worker.isRunning():
+                worker.request_stop()
+                worker.quit()
+                if not worker.wait(2000):
+                    print("[AppWindow] WebSocket 工作线程关闭超时", flush=True)
+                    worker.terminate()
+                    worker.wait(1000)
+        except RuntimeError:
+            pass
+        finally:
+            self.auth_ws_worker = None
+            self._ws_status = "disconnected"
 
     def _refresh_auth_title_button(self):
         title_bar = getattr(self, "title_bar", None)
@@ -3855,13 +4220,20 @@ class AppWindow(QMainWindow):
         if not self.auth_state.device_hash:
             self.auth_state.device_hash = self.auth_device_hash
         if persist:
-            save_auth_state(self.auth_state)
+            QTimer.singleShot(0, lambda s=self.auth_state: save_auth_state(s))
         self._log_auth_clock_skew_if_needed(self.auth_state)
         self.update_primary_buttons()
         self._refresh_auth_title_button()
         dialog = getattr(self, "auth_dialog", None)
         if dialog is not None and dialog.isVisible() and hasattr(dialog, "refresh_auth_state_view"):
             dialog.refresh_auth_state_view()
+        # V2 WebSocket: update JWT or start WS if needed
+        if getattr(self.auth_state, 'protocol_version', 1) >= 2 and self.auth_state.jwt_token:
+            ws_worker = getattr(self, "auth_ws_worker", None)
+            if ws_worker is not None and ws_worker.isRunning():
+                ws_worker.update_jwt(self.auth_state.jwt_token)
+            elif not getattr(self, "_shutting_down", False):
+                QTimer.singleShot(1000, self._start_websocket_worker)
 
     def mark_authorization_dialog_dismissed(self):
         self._auth_dialog_dismissed_until = time.time() + 60
@@ -3877,15 +4249,25 @@ class AppWindow(QMainWindow):
             self.auth_dialog.raise_()
             self.auth_dialog.activateWindow()
             return
-        self.auth_dialog = AuthorizationDialog(self)
-        dialog = self.auth_dialog
-        dialog.finished.connect(lambda _result: self.update_primary_buttons())
-        dialog.move(self.geometry().center() - dialog.rect().center())
-        dialog.open()
+        if self.auth_dialog is None:
+            self.auth_dialog = AuthorizationDialog(self)
+            self.auth_dialog.finished.connect(lambda _result: self.update_primary_buttons())
+        self.auth_dialog.refresh_auth_state_view()
+        if start_recheck:
+            self.auth_dialog.recheck_authorization()
+        self.auth_dialog.show()
+        self.auth_dialog.raise_()
+        self.auth_dialog.activateWindow()
 
     def ensure_authorized_for_action(self, action_label):
         if not self._auth_required():
             return True
+        # Explicit status gate: reject revoked/released/deleted regardless of cache
+        if self.auth_state.status in ("revoked", "released", "deleted", "suspended", "group_leave"):
+            self.write_log(f"[来源验证] {action_label} 已拦截：status={self.auth_state.status}")
+            self.show_toast("授权已停用，请联系管理员", "warning")
+            self._show_authorization_dialog(force=True, start_recheck=False)
+            return False
         decision = self._auth_decision()
         if decision.allowed and (self.auth_verified_this_session or self._verify_authorization_now_for_action(action_label)):
             return True
@@ -3895,13 +4277,17 @@ class AppWindow(QMainWindow):
         return False
 
     def _verify_authorization_now_for_action(self, action_label):
-        if not self.auth_state.access_token:
+        if not self.auth_state.access_token and not self.auth_state.jwt_token:
             return False
         try:
-            result = AuthClient(self._auth_base_url(), timeout=8).check_entitlement(
-                self.auth_state.access_token,
-                self.auth_device_hash,
-            )
+            client = AuthClient(self._auth_base_url(), timeout=8)
+            if getattr(self.auth_state, 'protocol_version', 1) >= 2 and self.auth_state.jwt_token:
+                result = client.check_entitlement_v2(
+                    self.auth_state.jwt_token, self.auth_device_hash,
+                    device_hash_v2=self.auth_device_hash_v2)
+            else:
+                result = client.check_entitlement(
+                    self.auth_state.access_token, self.auth_device_hash)
         except Exception as exc:
             self.write_log(f"[来源验证] {action_label} 首次在线复验失败：{exc}")
             return False
@@ -3924,9 +4310,17 @@ class AppWindow(QMainWindow):
             activation_id=self.auth_state.activation_id,
             user_code=str(result.get("user_code") or self.auth_state.user_code or ""),
             message="授权有效",
+            refresh_token=self.auth_state.refresh_token,
+            refresh_expires_at=self.auth_state.refresh_expires_at,
+            license_data=self.auth_state.license_data,
+            license_expires_at=self.auth_state.license_expires_at,
         )
         state.apply_check_timing(server_time)
         self.auth_verified_this_session = True
+        if _process_hosts_update(result):
+            state.cached_hosts = json.dumps(result.get("hosts", []))
+        elif self.auth_state.cached_hosts:
+            state.cached_hosts = self.auth_state.cached_hosts
         self._apply_auth_state(state, persist=True)
         return True
 
@@ -3948,7 +4342,11 @@ class AppWindow(QMainWindow):
             if not silent:
                 self._show_authorization_dialog(force=reason in ("manual", "action_gate"), start_recheck=False)
             return
-        self.auth_check_worker = AuthCheckWorker(base_url, self.auth_state, self.auth_device_hash, self)
+        # V2 protocol: use JWT-based check if protocol_version >= 2 and jwt_token exists
+        if getattr(self.auth_state, 'protocol_version', 1) >= 2 and self.auth_state.jwt_token:
+            self.auth_check_worker = AuthCheckWorkerV2(base_url, self.auth_state, self.auth_device_hash, device_hash_v2=self.auth_device_hash_v2, parent=self)
+        else:
+            self.auth_check_worker = AuthCheckWorker(base_url, self.auth_state, self.auth_device_hash, device_hash_v2=self.auth_device_hash_v2, parent=self)
         self.auth_check_worker.completed.connect(self._handle_authorization_check_result)
         self.auth_check_worker.finished.connect(self.auth_check_worker.deleteLater)
         self.auth_check_worker.start()
@@ -3968,19 +4366,55 @@ class AppWindow(QMainWindow):
         reason = str(getattr(self, "_last_auth_check_reason", "scheduled") or "scheduled")
         self.auth_manual_check_in_progress = False
         self.auth_check_worker = None
-        result_token = str(getattr(state, "access_token", "") or "")
-        current_token = str(getattr(self.auth_state, "access_token", "") or "")
-        if result_token and result_token != current_token:
-            self.write_log("[来源验证] 已忽略过期授权复验结果。")
-            self._refresh_auth_title_button()
-            return
+        # V2 uses JWT for auth, not access_token -- skip stale-token check for V2
+        if getattr(self.auth_state, 'protocol_version', 1) < 2:
+            result_token = str(getattr(state, "access_token", "") or "")
+            current_token = str(getattr(self.auth_state, "access_token", "") or "")
+            if result_token and result_token != current_token:
+                self.write_log("[来源验证] 已忽略过期授权复验结果。")
+                self._refresh_auth_title_button()
+                return
         if ok:
             self.auth_verified_this_session = True
+            if isinstance(result, dict) and _process_hosts_update(result):
+                state.cached_hosts = json.dumps(result.get("hosts", []))
+            elif self.auth_state.cached_hosts:
+                state.cached_hosts = self.auth_state.cached_hosts
+            # Save license from server response if present
+            if isinstance(result, dict) and result.get("license"):
+                self.write_log(f"[来源验证] 服务端返回 license 数据，正在保存...")
+                try:
+                    from core.auth_license import save_license
+                    QTimer.singleShot(0, lambda lb=result["license"]: save_license(lb))
+                    state.license_data = json.dumps(result["license"], ensure_ascii=False)
+                    state.license_expires_at = float(
+                        (result["license"].get("payload") or {}).get("expires_at")
+                        or result.get("license_expires_at") or 0
+                    )
+                except Exception:
+                    pass
+            elif isinstance(result, dict):
+                if not state.license_expires_at and self.auth_state.license_expires_at:
+                    state.license_expires_at = self.auth_state.license_expires_at
             self._apply_auth_state(state, persist=True)
             self._refresh_auth_title_button()
+            # V1→V2 migration: check if server returned JWT directly
+            if isinstance(result, dict) and result.get("jwt_token") and getattr(state, 'protocol_version', 1) < 2:
+                from core.auth_client import decode_jwt_payload
+                jwt_payload = decode_jwt_payload(result["jwt_token"])
+                state.jwt_token = str(result["jwt_token"])
+                state.jwt_expires_at = float(jwt_payload.get("exp", 0)) if jwt_payload else float(result.get("jwt_expires_at", 0))
+                state.jwt_issued_monotonic = time.monotonic()
+                state.protocol_version = 2
+                from core.auth_store import save_auth_state
+                save_auth_state(state)
+                self.write_log("[来源验证] V1→V2 迁移成功，已获取 JWT。")
+                self.auth_state = state
+                QTimer.singleShot(1000, self._start_websocket_worker)
             return
         recovery = classify_auth_recovery(self.auth_state, result or {}, network_error=network_error)
-        if network_error and self.auth_state.is_usable(time.time(), self._auth_offline_grace_seconds()):
+        is_v2 = getattr(self.auth_state, 'protocol_version', 1) >= 2
+        if network_error and not is_v2 and self.auth_state.is_usable(time.time(), self._auth_offline_grace_seconds()):
             self.write_log(f"[来源验证] 在线复验失败，暂按离线宽限继续：{message}")
             self._refresh_auth_title_button()
             return
@@ -4276,6 +4710,7 @@ class AppWindow(QMainWindow):
         self._stop_worker_thread("update_check_worker", "更新检查线程", wait_ms=1200)
         self._stop_worker_thread("auth_check_worker", "授权校验线程", wait_ms=1200)
         self._stop_worker_thread("ocr_init_worker", "识别初始化线程", wait_ms=1800)
+        self._stop_websocket_worker()
 
     def _stop_worker_thread(self, attr_name, label, wait_ms=1200, terminate_wait_ms=800):
         worker = getattr(self, attr_name, None)
@@ -5228,14 +5663,14 @@ class AppWindow(QMainWindow):
         self._settings_readonly_block(
             auth_layout,
             "在线复验间隔",
-            "程序运行期间固定每 1 分钟向服务器静默复验一次。用户退群、授权吊销或设备超限后，会在下一次复验时锁定功能。",
-            "1min",
+            "程序运行期间固定每 5 分钟向服务器静默复验一次。用户退群、授权吊销或设备超限后，会在下一次复验时锁定功能。",
+            "5min",
         )
         self._settings_readonly_block(
             auth_layout,
             "离线宽限时间",
-            "服务器临时不可达时，已授权用户最多可在最近一次成功复验后继续使用 5 分钟；超过后必须重新在线验证。",
-            "5min",
+            "服务器不可达时，已授权用户可在最近一次成功复验后继续使用最多 12 小时；超过后必须联网恢复。",
+            "12小时",
         )
         self._settings_action_buttons_block(
             auth_layout,

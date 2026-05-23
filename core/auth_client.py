@@ -1,3 +1,4 @@
+import base64
 import json
 import re
 import shutil
@@ -8,13 +9,16 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from core.auth_policy import AUTH_SERVER_HOSTS, is_ip_host
+from core.auth_policy import get_effective_hosts, is_ip_host, update_remote_hosts
 from core.paths import app_base_dir, resource_path
 
 
 AUTH_CA_FILENAMES = ("yho_auth_ca.pem", "yho_root_ca.pem")
-AUTH_CHECK_INTERVAL_SECONDS = 300
-AUTH_OFFLINE_GRACE_SECONDS = 14 * 24 * 60 * 60
+AUTH_CHECK_INTERVAL_SECONDS = 600
+AUTH_OFFLINE_GRACE_SECONDS = 0
+JWT_REFRESH_LEAD_SECONDS = 300
+WS_PING_INTERVAL_SECONDS = 30
+WS_RECONNECT_DELAYS = (1, 2, 4, 8, 30)
 DETERMINISTIC_AUTH_FAILURE_STATUSES = {
     "not_found",
     "released",
@@ -30,6 +34,7 @@ AUTH_REBIND_STATUSES = {
     "expired",
     "token_already_issued",
     "missing_token",
+    "invalid_token",
 }
 AUTH_ADMIN_BLOCKED_STATUSES = {
     "revoked",
@@ -280,7 +285,6 @@ class AuthClient:
         self.transport = transport
         self.ca_bundle_path = ca_bundle_path if ca_bundle_path is not None else find_auth_ca_bundle()
         self._ssl_context = None
-        self.is_failover = False
         if not self.base_url:
             raise AuthClientError("授权服务器地址未配置")
 
@@ -404,14 +408,13 @@ class AuthClient:
         return self._request("GET", "/public/groups")
 
     def _request_with_failover(self, method, path, payload=None, token=None):
-        """Try each host in AUTH_SERVER_HOSTS until one succeeds. IP first for low latency."""
+        """Try each host in effective hosts until one succeeds. IP first for low latency."""
         last_error = None
-        for host in AUTH_SERVER_HOSTS:
+        for host in get_effective_hosts():
             try:
                 base_url = f"https://{host}/api"
                 ca_path = _ca_for_host(host, self.ca_bundle_path)
                 client = AuthClient(base_url, timeout=self.timeout, ca_bundle_path=ca_path)
-                client.is_failover = True
                 return client._request(method, path, payload, token)
             except AuthClientError as exc:
                 last_error = exc
@@ -419,11 +422,88 @@ class AuthClient:
         raise AuthClientError(str(last_error) if last_error else "所有授权服务器均不可达")
 
     def refresh_access_token(self, refresh_token, device_hash_v2="", device_hash=""):
-        """Exchange refresh_token for new access_token + new refresh_token (rotation)."""
-        payload = {"device_hash": device_hash}
+        """V1 refresh. Server may attach jwt_token in response for V1→V2 migration."""
+        payload = {"refresh_token": refresh_token, "device_hash": device_hash}
         if device_hash_v2:
             payload["device_hash_v2"] = device_hash_v2
         return self._request_with_failover("POST", "/token/refresh", payload, token=refresh_token)
+
+    def reactivate_entitlement(self, qq_user_id_hash, device_hash, device_hash_v2=""):
+        """Recover an expired entitlement by proving group membership + device ownership."""
+        payload = {"qq_user_id_hash": qq_user_id_hash, "device_hash": device_hash}
+        if device_hash_v2:
+            payload["device_hash_v2"] = device_hash_v2
+        return self._request_with_failover("POST", "/entitlement/reactivate", payload)
+
+    def check_entitlement_v2(self, jwt_token, device_hash, device_hash_v2="", hw_ids=None):
+        """V2 JWT-based entitlement check."""
+        body = {"device_hash": device_hash}
+        if device_hash_v2:
+            body["device_hash_v2"] = device_hash_v2
+        if hw_ids:
+            body["hw_ids"] = hw_ids
+        return self._request_with_failover("POST", "/v2/entitlement/check", body, token=jwt_token)
+
+    def refresh_token_v2(self, refresh_token, device_hash_v2="", device_hash=""):
+        """V2 token rotation: refresh_token → new JWT + new refresh_token."""
+        payload = {"refresh_token": refresh_token, "device_hash": device_hash}
+        if device_hash_v2:
+            payload["device_hash_v2"] = device_hash_v2
+        return self._request_with_failover("POST", "/v2/token/refresh", payload)
+
+    def reactivate_entitlement_v2(self, qq_user_id_hash, device_hash, device_hash_v2=""):
+        """V2 reactivate: group member verify → JWT + refresh_token."""
+        payload = {"qq_user_id_hash": qq_user_id_hash, "device_hash": device_hash}
+        if device_hash_v2:
+            payload["device_hash_v2"] = device_hash_v2
+        return self._request_with_failover("POST", "/v2/entitlement/reactivate", payload)
+
+
+def decode_jwt_payload(token):
+    """Decode JWT payload without signature verification (client-side exp/iat read only)."""
+    try:
+        parts = str(token or "").split(".")
+        if len(parts) != 3:
+            return None
+        payload_b64 = parts[1]
+        padding = 4 - len(payload_b64) % 4
+        if padding != 4:
+            payload_b64 += "=" * padding
+        raw = base64.urlsafe_b64decode(payload_b64)
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _verify_hosts_signature(hosts, signature_b64):
+    """Verify ECDSA-P256-SHA256 signature of a hosts list. Returns True if valid."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives import hashes, serialization
+        from core.auth_license import get_public_key
+
+        pubkey_pem = get_public_key()
+        if not pubkey_pem:
+            return False
+        public_key = serialization.load_pem_public_key(pubkey_pem)
+        payload_bytes = json.dumps(hosts, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        signature = base64.b64decode(signature_b64)
+        public_key.verify(signature, payload_bytes, ec.ECDSA(hashes.SHA256()))
+        return True
+    except Exception:
+        return False
+
+
+def _process_hosts_update(response_data):
+    """Process hosts update from server auth response. Returns True if hosts were updated."""
+    hosts = response_data.get("hosts")
+    sig = response_data.get("hosts_sig", "")
+    if not hosts or not sig or not isinstance(hosts, list):
+        return False
+    if not _verify_hosts_signature(hosts, sig):
+        return False
+    update_remote_hosts(hosts)
+    return True
 
 
 def auth_config_required(config):
@@ -449,17 +529,24 @@ def decide_cached_authorization(config, state, now=None):
     if not auth_config_required(config):
         return GateDecision(True, "disabled", "来源验证未启用")
     current = time.time() if now is None else float(now)
-    # First try normal online auth
-    if state is not None and state.is_usable(current, auth_offline_grace_seconds(config)):
+    # V2: grace=0, no license fallback
+    is_v2 = getattr(state, 'protocol_version', 1) >= 2
+    grace = 0 if is_v2 else auth_offline_grace_seconds(config)
+    if state is not None and state.is_usable(current, grace):
         return GateDecision(True, "authorized", "授权缓存有效")
-    # Then try license-based offline auth
-    try:
-        from core.auth_license import is_license_usable, load_license
-        license_blob = load_license()
-        if license_blob:
-            usable, status, message, expires_at, should_renew = is_license_usable(license_blob, now=current)
-            if usable:
-                return GateDecision(True, "licensed", f"离线授权有效 ({message})")
-    except ImportError:
-        pass
+    # Block license fallback if binding is explicitly terminated
+    state_status = str(getattr(state, "status", "") or "").strip().lower()
+    if state_status in ("revoked", "released", "deleted", "suspended", "group_leave"):
+        return GateDecision(False, "needs_activation", "授权已停用，需要重新绑定")
+    # V1 only: try license-based offline auth
+    if not is_v2:
+        try:
+            from core.auth_license import is_license_usable, load_license
+            license_blob = load_license()
+            if license_blob:
+                usable, status, message, expires_at, should_renew = is_license_usable(license_blob, now=current)
+                if usable:
+                    return GateDecision(True, "licensed", f"离线授权有效 ({message})")
+        except ImportError:
+            pass
     return GateDecision(False, "needs_activation", "需要完成来源验证")

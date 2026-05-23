@@ -135,13 +135,15 @@ def _collect_hardware_ids():
     }
 
 
-def build_device_hash_v2(install_id=None, hw_ids=None):
-    local_install_id = install_id or get_or_create_install_id()
+def get_hardware_ids():
+    return _collect_hardware_ids()
+
+
+def build_device_hash_v2(hw_ids=None):
     if hw_ids is None:
         hw_ids = _collect_hardware_ids()
     parts = [
         "YHoAutoFish-device-v2",
-        f"install_id={local_install_id}",
         f"bios_uuid={hw_ids.get('bios_uuid', '')}",
         f"cpu_id={hw_ids.get('cpu_id', '')}",
         f"board_serial={hw_ids.get('board_serial', '')}",

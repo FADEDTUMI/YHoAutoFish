@@ -34,6 +34,12 @@ class AuthState:
     refresh_expires_at: float = 0.0
     license_data: str = ""
     license_expires_at: float = 0.0
+    cached_hosts: str = ""
+    device_hash_v2: str = ""
+    jwt_token: str = ""
+    jwt_expires_at: float = 0.0
+    jwt_issued_monotonic: float = 0.0
+    protocol_version: int = 1
 
     @classmethod
     def from_dict(cls, data):
@@ -51,6 +57,12 @@ class AuthState:
         state.message = str(state.message or "")
         state.refresh_token = str(state.refresh_token or "")
         state.license_data = str(state.license_data or "")
+        state.cached_hosts = str(state.cached_hosts or "")
+        state.device_hash_v2 = str(state.device_hash_v2 or "")
+        state.jwt_token = str(state.jwt_token or "")
+        state.jwt_expires_at = _as_float(state.jwt_expires_at)
+        state.jwt_issued_monotonic = _as_float(state.jwt_issued_monotonic)
+        state.protocol_version = int(state.protocol_version or 1)
         state.expires_at = _as_float(state.expires_at)
         state.last_checked_at = _as_float(state.last_checked_at)
         state.local_checked_at = _as_float(state.local_checked_at)
@@ -101,8 +113,35 @@ class AuthState:
             return 0.0
         return current
 
+    def is_jwt_usable(self, now=None, monotonic_now=None):
+        """V2 JWT validity: wall clock exp + monotonic clock dual check (anti-rollback)."""
+        if not self.jwt_token or self.protocol_version < 2:
+            return False
+        current = time.time() if now is None else float(now)
+        if self.jwt_expires_at and current >= float(self.jwt_expires_at):
+            return False
+        mono_issued = float(self.jwt_issued_monotonic or 0)
+        if mono_issued > 0:
+            current_mono = time.monotonic() if monotonic_now is None else float(monotonic_now)
+            elapsed = current_mono - mono_issued
+            if elapsed < -1:
+                return False
+            jwt_ttl = float(self.jwt_expires_at or 0) - float(self.last_checked_at or 0)
+            if jwt_ttl > 0 and elapsed > jwt_ttl + 300:
+                return False
+        return True
+
     def is_usable(self, now=None, offline_grace_seconds=0, monotonic_now=None, allow_license_fallback=False):
         current = time.time() if now is None else float(now)
+        # Block revoked/released/deleted/suspended in BOTH V1 and V2 (no fallback allowed)
+        if self.status in ("revoked", "released", "deleted", "suspended", "group_leave"):
+            return False
+        # V2 path: JWT + monotonic clock, no offline grace
+        if self.protocol_version >= 2 and self.jwt_token:
+            if self.is_jwt_usable(now=current, monotonic_now=monotonic_now):
+                return True
+            return False
+        # V1 path: original logic unchanged
         if self.status != "authorized" or not self.access_token:
             if allow_license_fallback and self.license_data and self.license_expires_at > current:
                 return True

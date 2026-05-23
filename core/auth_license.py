@@ -14,7 +14,8 @@ from core.paths import resource_path, writable_path
 LICENSE_PUBLIC_KEY_PEM = None  # Loaded lazily
 LICENSE_PUBKEY_FILENAMES = ("yho_license_pubkey.pem",)
 LICENSE_FILE = "auth_license.dat"
-LICENSE_GRACE_DAYS = 14
+LICENSE_GRACE_HOURS = 12
+LICENSE_GRACE_DAYS = LICENSE_GRACE_HOURS / 24
 LICENSE_RENEW_THRESHOLD_DAYS = 3
 
 _SECONDS_PER_DAY = 86400

@@ -1,0 +1,5 @@
+Collecting websocket-client
+  Downloading websocket_client-1.9.0-py3-none-any.whl.metadata (8.3 kB)
+Downloading websocket_client-1.9.0-py3-none-any.whl (82 kB)
+Installing collected packages: websocket-client
+Successfully installed websocket-client-1.9.0
