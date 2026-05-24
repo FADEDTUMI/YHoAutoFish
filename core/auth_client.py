@@ -11,6 +11,7 @@ from pathlib import Path
 
 from core.auth_policy import get_effective_hosts, is_ip_host, update_remote_hosts
 from core.paths import app_base_dir, resource_path
+from core.version import APP_VERSION
 
 
 AUTH_CA_FILENAMES = ("yho_auth_ca.pem", "yho_root_ca.pem")
@@ -308,7 +309,7 @@ class AuthClient:
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "YHoAutoFish-auth-client/1",
+            "User-Agent": f"YHoAutoFish/{APP_VERSION}",
         }
         if token:
             headers["Authorization"] = f"Bearer {token}"

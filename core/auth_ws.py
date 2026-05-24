@@ -4,7 +4,9 @@ Uses synchronous `websocket-client` library, natively compatible with QThread.
 """
 import json
 import logging
+import platform
 import ssl
+import sys
 import threading
 import time
 
@@ -13,6 +15,24 @@ from PySide6.QtCore import QThread, Signal
 log = logging.getLogger(__name__)
 
 WS_RECONNECT_DELAYS = (1, 2, 4, 8, 30)
+
+
+def _client_app_version():
+    try:
+        from core.version import APP_VERSION
+        return APP_VERSION
+    except ImportError:
+        return "unknown"
+
+
+def _client_env():
+    try:
+        os_name = platform.system().lower()
+        os_ver = platform.release().replace(".", "")
+        py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+        return f"{os_name}{os_ver}-py{py_ver}"
+    except Exception:
+        return "unknown"
 
 
 def _build_ws_ssl_context(host):
@@ -36,6 +56,9 @@ class AuthWSWorker(QThread):
     revoked = Signal(str, str)
     status_changed = Signal(str)
     error = Signal(str)
+    notification_received = Signal(str)
+    force_disconnect_received = Signal(str)
+    trigger_upgrade_received = Signal(str)
 
     def __init__(self, ws_url, jwt_token, license_id, parent=None):
         super().__init__(parent)
@@ -70,7 +93,7 @@ class AuthWSWorker(QThread):
                 self._stop.wait(15)
                 continue
 
-            url = f"{self.ws_url}?token={self.jwt_token}"
+            url = f"{self.ws_url}?token={self.jwt_token}&v={_client_app_version()}&pv=2&env={_client_env()}"
             host = self.ws_url.split("://")[-1].split("/")[0].split("?")[0]
             sslopt = {}
             ssl_ctx = _build_ws_ssl_context(host)
@@ -82,7 +105,7 @@ class AuthWSWorker(QThread):
                 ws = websocket.create_connection(
                     url,
                     timeout=15,
-                    header={"User-Agent": "YHoAutoFish/1.4.0"},
+                    header={"User-Agent": f"YHoAutoFish/{_client_app_version()}"},
                     sslopt=sslopt,
                     host=host,
                 )
@@ -133,3 +156,13 @@ class AuthWSWorker(QThread):
         if event == "revoked":
             reason = str(data.get("reason") or "revoked")
             self.revoked.emit(self.license_id, reason)
+        elif event == "notification":
+            message = str(data.get("message") or "")
+            self.notification_received.emit(message)
+        elif event == "force_disconnect":
+            reason = str(data.get("reason") or "admin_disconnect")
+            self.force_disconnect_received.emit(reason)
+            self._stop.set()
+        elif event == "trigger_upgrade":
+            min_version = str(data.get("min_version") or "")
+            self.trigger_upgrade_received.emit(min_version)

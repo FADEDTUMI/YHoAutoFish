@@ -1385,6 +1385,19 @@ def download_update(update_info, progress_callback=None, timeout=25, source=UPDA
     if update_info is None:
         raise UpdateError("没有可下载的更新信息")
 
+    # Direct URL download: bypass GitHub/Gitee candidates
+    if str(source or "").strip().lower() == "direct":
+        direct_url = str(getattr(update_info, "url", "") or "").strip()
+        if not direct_url:
+            raise UpdateError("直连下载地址为空")
+        download_root = _update_subdir(UPDATE_DOWNLOAD_DIR_NAME)
+        _cleanup_old_children(download_root, max_age_seconds=86400)
+        filename = direct_url.rsplit("/", 1)[-1].split("?")[0] or "update.zip"
+        target_path = download_root / filename
+        _raise_if_cancelled(cancel_callback)
+        _download_once(direct_url, target_path, progress_callback=progress_callback, timeout=timeout, cancel_callback=cancel_callback)
+        return str(target_path)
+
     download_root = _update_subdir(UPDATE_DOWNLOAD_DIR_NAME)
     _cleanup_old_children(download_root, max_age_seconds=86400)
     target_path = download_root / update_info.asset_name

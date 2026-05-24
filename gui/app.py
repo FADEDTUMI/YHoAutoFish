@@ -914,6 +914,104 @@ class UpdateDownloadWorker(QThread):
                 self.completed.emit(False, "", str(exc))
 
 
+class ForceUpdateDialog(QDialog):
+    """Non-closeable forced update dialog shown when server requires minimum version."""
+
+    update_started = Signal()
+
+    def __init__(self, min_version, update_url="", changelog="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("需要更新")
+        self.setMinimumWidth(420)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowCloseButtonHint)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        self._update_url = update_url
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        title = QLabel(f"当前版本过低，需要更新到 v{min_version} 或更高版本")
+        title.setWordWrap(True)
+        title.setStyleSheet("font-size: 14px; font-weight: bold; color: #e74c3c;")
+        layout.addWidget(title)
+
+        if changelog:
+            log_label = QLabel("更新日志：")
+            log_label.setStyleSheet("font-weight: bold;")
+            layout.addWidget(log_label)
+            log_text = QPlainTextEdit(changelog)
+            log_text.setReadOnly(True)
+            log_text.setMaximumHeight(120)
+            layout.addWidget(log_text)
+
+        hint = QLabel("点击下方按钮自动下载并安装更新。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        btn_layout = QHBoxLayout()
+        self.update_btn = QPushButton("立即更新")
+        self.update_btn.setStyleSheet("padding: 8px 24px; font-weight: bold;")
+        self.update_btn.clicked.connect(self._on_update)
+        btn_layout.addWidget(self.update_btn)
+        layout.addLayout(btn_layout)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+
+        self.status_label = QLabel("")
+        self.status_label.setVisible(False)
+        layout.addWidget(self.status_label)
+
+        self._worker = None
+
+    def closeEvent(self, event):
+        event.ignore()
+
+    def _on_update(self):
+        self.update_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.status_label.setVisible(True)
+        self.status_label.setText("正在检查更新源...")
+        self.update_started.emit()
+        try:
+            from core.updater import UpdateInfo, check_for_update
+            if self._update_url:
+                info = UpdateInfo(version="", url=self._update_url, asset_name="", body="")
+                source = "direct"
+            else:
+                info = check_for_update(timeout=10)
+                if not info:
+                    self.status_label.setText("未获取到更新包，请手动前往发布页下载。")
+                    self.update_btn.setEnabled(True)
+                    self.progress_bar.setVisible(False)
+                    return
+                source = "github"
+            self.status_label.setText("正在下载更新...")
+            self._worker = UpdateDownloadWorker(info, source=source, parent=self)
+            self._worker.progress.connect(self._on_progress)
+            self._worker.completed.connect(self._on_completed)
+            self._worker.start()
+        except Exception as exc:
+            self.status_label.setText(f"下载失败: {exc}")
+            self.update_btn.setEnabled(True)
+            self.progress_bar.setVisible(False)
+
+    def _on_progress(self, percent):
+        self.progress_bar.setValue(percent)
+
+    def _on_completed(self, ok, path, error):
+        if ok and path:
+            self.status_label.setText("下载完成，正在启动安装...")
+            import subprocess
+            subprocess.Popen([path])
+        else:
+            self.status_label.setText(f"下载失败: {error}")
+            self.update_btn.setEnabled(True)
+            self.progress_bar.setVisible(False)
+
+
 class AuthCheckWorker(QThread):
     completed = Signal(bool, object, str, bool, object)
 
@@ -4351,6 +4449,14 @@ class AppWindow(QMainWindow):
         self.auth_check_worker.finished.connect(self.auth_check_worker.deleteLater)
         self.auth_check_worker.start()
 
+    def _show_force_update_dialog(self, min_version, update_url="", changelog=""):
+        if getattr(self, "_force_update_dialog_shown", False):
+            return
+        self._force_update_dialog_shown = True
+        self.write_log(f"[强制升级] 服务端要求最低版本 v{min_version}，当前版本 v{APP_VERSION}")
+        dlg = ForceUpdateDialog(min_version, update_url=update_url, changelog=changelog, parent=self)
+        dlg.exec()
+
     def _show_auth_failure_toast(self, message, tone="danger"):
         key = str(message or "auth_failure")[:120]
         now = time.time()
@@ -4411,6 +4517,14 @@ class AppWindow(QMainWindow):
                 self.write_log("[来源验证] V1→V2 迁移成功，已获取 JWT。")
                 self.auth_state = state
                 QTimer.singleShot(1000, self._start_websocket_worker)
+            # Force update check
+            if isinstance(result, dict) and result.get("force_update"):
+                fu = result["force_update"]
+                QTimer.singleShot(500, lambda: self._show_force_update_dialog(
+                    fu.get("min_version", ""),
+                    fu.get("update_url", ""),
+                    fu.get("changelog", ""),
+                ))
             return
         recovery = classify_auth_recovery(self.auth_state, result or {}, network_error=network_error)
         is_v2 = getattr(self.auth_state, 'protocol_version', 1) >= 2
