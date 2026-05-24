@@ -839,6 +839,7 @@ class NoWheelSlider(QSlider):
 
 class RecognitionInitWorker(QThread):
     completed = Signal(bool, str)
+    progress = Signal(str)
 
     def __init__(self, state_machine, parent=None):
         super().__init__(parent)
@@ -846,7 +847,9 @@ class RecognitionInitWorker(QThread):
 
     def run(self):
         try:
-            ok = self.state_machine.prepare_recognition_modules()
+            ok = self.state_machine.prepare_recognition_modules(
+                progress_fn=lambda msg: self.progress.emit(msg)
+            )
             if self.isInterruptionRequested():
                 return
             if ok:
@@ -5146,11 +5149,12 @@ class AppWindow(QMainWindow):
         self.init_animation_step = 0
         self.init_animation_timer.start(360)
         self.update_primary_buttons()
-        self.write_log("[系统] 开始初始化鱼名、重量与界面文字 OCR 识别模块...")
+        self.write_log("[系统] 开始初始化识别模块与视觉模板预热...")
         self.show_toast("正在初始化识别模块", "info")
 
         self.ocr_init_worker = RecognitionInitWorker(self.sm, self)
         self.ocr_init_worker.completed.connect(self._handle_module_init_result)
+        self.ocr_init_worker.progress.connect(self._handle_module_init_progress)
         self.ocr_init_worker.finished.connect(self.ocr_init_worker.deleteLater)
         self.ocr_init_worker.start()
 
@@ -5165,6 +5169,12 @@ class AppWindow(QMainWindow):
         toast_message = message if ok else "识别模块初始化失败，详情已写入运行日志。"
         self.show_toast(toast_message, "success" if ok else "danger")
         self.ocr_init_worker = None
+
+    def _handle_module_init_progress(self, message):
+        """显示初始化子步骤的进度日志，预热失败时显示警告。"""
+        self.write_log(f"[初始化] {message}")
+        if "预热步骤失败" in message or "失败" in message:
+            self.show_toast("部分预热步骤失败，首帧处理可能较慢", "warning")
 
     def show_usage_policy(self):
         html = """

@@ -39,7 +39,7 @@ class FishingBarDetector:
             cursor_jump_limit = max(72, int(roi_width * 0.24))
             if cursor_jump > cursor_jump_limit and confidence < 0.86:
                 self._sm.round.bar_cursor_jump_reject_count = int(getattr(self._sm.round, "bar_cursor_jump_reject_count", 0)) + 1
-                if self._sm.round.bar_cursor_jump_reject_count <= 2:
+                if self._sm.round.bar_cursor_jump_reject_count <= 4:
                     cursor_x = previous_cursor_x
                     confidence = max(0.0, confidence * 0.75)
                 else:

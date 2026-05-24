@@ -11,6 +11,9 @@ class VisionCore:
         }
         self._template_cache = {}
         self._processed_template_cache = {}
+        # 预分配固定尺寸形态学核，避免每帧重复创建
+        self._kernel_3x3 = np.ones((3, 3), np.uint8)
+        self._kernel_2x3 = np.ones((2, 3), np.uint8)
         
     def update_hsv_config(self, color_name, min_val, max_val):
         """用于GUI动态调节HSV参数"""
@@ -104,7 +107,7 @@ class VisionCore:
                 lower = int(max(0, (1.0 - 0.33) * v))
                 upper = int(min(255, (1.0 + 0.33) * v))
                 mask = cv2.Canny(gray, lower, upper)
-                mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+                mask = cv2.dilate(mask, self._kernel_3x3, iterations=1)
             elif use_binary:
                 threshold = max(1, min(245, int(binary_threshold) - 25))
                 _, mask = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
@@ -569,7 +572,7 @@ class VisionCore:
             initial_reference_mask = self._target_reference_mask(hsv, reference_paths, relaxed=False)
             if initial_reference_mask is not None and cv2.countNonZero(initial_reference_mask) >= max(8, int(roi_w * roi_h * 0.00020)):
                 initial_reference_mask = cv2.morphologyEx(initial_reference_mask, cv2.MORPH_CLOSE, np.ones((3, max(3, int(roi_w * 0.008))), np.uint8))
-                initial_reference_mask = cv2.morphologyEx(initial_reference_mask, cv2.MORPH_OPEN, np.ones((2, 3), np.uint8))
+                initial_reference_mask = cv2.morphologyEx(initial_reference_mask, cv2.MORPH_OPEN, self._kernel_2x3)
                 initial_target = self._select_reference_color_bar_component(
                     initial_reference_mask,
                     {"cy": roi_h * 0.5},
@@ -596,7 +599,7 @@ class VisionCore:
                 if cv2.countNonZero(refined_probe) >= max(8, int(roi_w * roi_h * 0.0004)):
                     green_probe_mask = refined_probe
             green_probe_mask = cv2.morphologyEx(green_probe_mask, cv2.MORPH_CLOSE, np.ones((3, max(7, int(roi_w * 0.025))), np.uint8))
-            green_probe_mask = cv2.morphologyEx(green_probe_mask, cv2.MORPH_OPEN, np.ones((2, 3), np.uint8))
+            green_probe_mask = cv2.morphologyEx(green_probe_mask, cv2.MORPH_OPEN, self._kernel_2x3)
             green_candidates = self._collect_green_bar_candidates(green_probe_mask, roi_w, roi_h)
 
         cursor_mask = self._cursor_reference_mask(hsv, cursor_reference_paths, relaxed=False)
@@ -608,7 +611,7 @@ class VisionCore:
             upper_yellow = np.maximum(upper_yellow, np.array([45, 255, 255], dtype=np.uint8))
             cursor_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
 
-        cursor_kernel = np.ones((3, 3), np.uint8)
+        cursor_kernel = self._kernel_3x3
         cursor_mask = cv2.morphologyEx(cursor_mask, cv2.MORPH_OPEN, cursor_kernel)
         cursor_mask = cv2.morphologyEx(cursor_mask, cv2.MORPH_CLOSE, cursor_kernel)
 
@@ -638,14 +641,14 @@ class VisionCore:
 
         target = None
         if has_reference_color:
-            reference_mask = self._target_reference_mask(hsv, reference_paths, relaxed=False)
+            reference_mask = initial_reference_mask  # 复用经形态学处理后的结果（第574-575行）
             if reference_mask is not None:
                 reference_band_mask = np.zeros_like(reference_mask)
                 reference_band_mask[band_y1:band_y2, :] = reference_mask[band_y1:band_y2, :]
                 if cv2.countNonZero(reference_band_mask[band_y1:band_y2, :]) >= max(8, int(roi_w * roi_h * 0.00020)):
                     ref_close_w = max(3, int(roi_w * 0.008))
                     reference_band_mask = cv2.morphologyEx(reference_band_mask, cv2.MORPH_CLOSE, np.ones((3, ref_close_w), np.uint8))
-                    reference_band_mask = cv2.morphologyEx(reference_band_mask, cv2.MORPH_OPEN, np.ones((2, 3), np.uint8))
+                    reference_band_mask = cv2.morphologyEx(reference_band_mask, cv2.MORPH_OPEN, self._kernel_2x3)
                     target = self._select_horizontal_run_green_bar(reference_band_mask, cursor, roi_w, roi_h, hsv=hsv)
                     if target is None:
                         target = self._select_reference_color_bar_component(reference_band_mask, cursor, roi_w, roi_h, hsv=hsv)
@@ -658,7 +661,7 @@ class VisionCore:
                     if cv2.countNonZero(relaxed_reference_band_mask[band_y1:band_y2, :]) >= max(8, int(roi_w * roi_h * 0.00020)):
                         relaxed_ref_close_w = max(3, int(roi_w * 0.010))
                         relaxed_reference_band_mask = cv2.morphologyEx(relaxed_reference_band_mask, cv2.MORPH_CLOSE, np.ones((3, relaxed_ref_close_w), np.uint8))
-                        relaxed_reference_band_mask = cv2.morphologyEx(relaxed_reference_band_mask, cv2.MORPH_OPEN, np.ones((2, 3), np.uint8))
+                        relaxed_reference_band_mask = cv2.morphologyEx(relaxed_reference_band_mask, cv2.MORPH_OPEN, self._kernel_2x3)
                         target = self._select_reference_color_bar_component(
                             relaxed_reference_band_mask,
                             cursor,
@@ -683,7 +686,7 @@ class VisionCore:
                     band_mask = refined_band_mask
             close_w = max(5, int(roi_w * 0.018))
             band_mask = cv2.morphologyEx(band_mask, cv2.MORPH_CLOSE, np.ones((3, close_w), np.uint8))
-            band_mask = cv2.morphologyEx(band_mask, cv2.MORPH_OPEN, np.ones((2, 3), np.uint8))
+            band_mask = cv2.morphologyEx(band_mask, cv2.MORPH_OPEN, self._kernel_2x3)
 
             target = self._select_green_bar_component(band_mask, roi_w, roi_h, band_y1, band_y2, cursor, hsv=hsv)
             if target is None:
@@ -691,7 +694,7 @@ class VisionCore:
             if target is None:
                 relaxed_close_w = max(5, int(roi_w * 0.020))
                 relaxed_band_mask = cv2.morphologyEx(relaxed_band_mask, cv2.MORPH_CLOSE, np.ones((3, relaxed_close_w), np.uint8))
-                relaxed_band_mask = cv2.morphologyEx(relaxed_band_mask, cv2.MORPH_OPEN, np.ones((2, 3), np.uint8))
+                relaxed_band_mask = cv2.morphologyEx(relaxed_band_mask, cv2.MORPH_OPEN, self._kernel_2x3)
                 target = self._select_green_bar_component(
                     relaxed_band_mask,
                     roi_w,
@@ -1330,7 +1333,7 @@ class VisionCore:
             if cv2.countNonZero(strict_mask) >= max(8, int(roi_w * roi_h * 0.00025)):
                 close_w = max(5, int(roi_w * (0.010 if relaxed else 0.008)))
                 work_mask = cv2.morphologyEx(strict_mask, cv2.MORPH_CLOSE, np.ones((3, close_w), np.uint8))
-                work_mask = cv2.morphologyEx(work_mask, cv2.MORPH_OPEN, np.ones((2, 3), np.uint8))
+                work_mask = cv2.morphologyEx(work_mask, cv2.MORPH_OPEN, self._kernel_2x3)
 
         count, labels, stats, centroids = cv2.connectedComponentsWithStats(work_mask, 8)
         pieces = []

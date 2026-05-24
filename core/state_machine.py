@@ -343,15 +343,139 @@ class StateMachine:
             return "OCR 模块初始化失败：本地 OCR 模型缺失，请使用完整发布包。"
         return "OCR 模块初始化失败，请检查完整发布包、cnocr/cnstd/onnxruntime 依赖与本地模型缓存。"
 
-    def prepare_recognition_modules(self):
-        """预热结算识别所需的 OCR 模块，避免首次上鱼时才加载导致卡顿。"""
-        self.ocr_module.prepare_ocr_runtime_roots()
+    def prepare_recognition_modules(self, progress_fn=None):
+        """预热所有识别模块：OCR、视觉模板、HSV 色彩轮廓、形态学管线。
+
+        Parameters
+        ----------
+        progress_fn : callable, optional
+            进度回调，签名 progress_fn(message: str)。
+        """
+        def _report(msg):
+            if progress_fn is not None:
+                try:
+                    progress_fn(msg)
+                except Exception:
+                    pass
+            self._log(f"[预热] {msg}")
+
+        # ── 第 1 步：OCR 运行时路径准备 ──
+        t0 = time.perf_counter()
+        _report("步骤 1/6: 准备 OCR 运行时路径...")
+        try:
+            self.ocr_module.prepare_ocr_runtime_roots()
+        except Exception as exc:
+            self._log(f"[预热] OCR 路径准备失败（非致命）: {exc}")
+        _report(f"步骤 1/6 完成 ({time.perf_counter() - t0:.2f}s)")
+
+        # ── 第 2 步：OCR 模型加载 ──
+        t0 = time.perf_counter()
+        _report("步骤 2/6: 加载 OCR 识别模型（名称/重量/通用）...")
         name_ocr = self.ocr_module.ensure_ocr("name")
         weight_ocr = self.ocr_module.ensure_ocr("weight")
         general_ocr = self.ocr_module.ensure_ocr("general")
-        # 图像兜底匹配同样需要首次构建特征，放在初始化阶段完成。
-        self.ocr_module.load_fish_matcher_refs()
+        _report(f"步骤 2/6 完成 ({time.perf_counter() - t0:.2f}s)")
+
+        # ── 第 3 步：图像兜底匹配参考图 ──
+        t0 = time.perf_counter()
+        _report("步骤 3/6: 加载图像兜底匹配参考图...")
+        try:
+            self.ocr_module.load_fish_matcher_refs()
+        except Exception as exc:
+            self._log(f"[预热] 图像匹配参考加载失败（非致命）: {exc}")
+        _report(f"步骤 3/6 完成 ({time.perf_counter() - t0:.2f}s)")
+
+        # ── 第 4 步：模板 PNG 预加载 ──
+        t0 = time.perf_counter()
+        _report("步骤 4/6: 预加载全部模板 PNG...")
+        preheat_warn = False
+        try:
+            self._preload_all_templates()
+        except Exception as exc:
+            self._log(f"[预热] ⚠️ 模板预加载失败: {exc}")
+            _report(f"⚠️ 步骤 4/6 模板预加载失败: {exc}")
+            preheat_warn = True
+        _report(f"步骤 4/6 完成 ({time.perf_counter() - t0:.2f}s)")
+
+        # ── 第 5 步：HSV 色彩轮廓预计算 ──
+        t0 = time.perf_counter()
+        _report("步骤 5/6: 预计算 HSV 色彩轮廓...")
+        try:
+            self._precompute_color_profiles()
+        except Exception as exc:
+            self._log(f"[预热] ⚠️ 色彩轮廓预计算失败: {exc}")
+            _report(f"⚠️ 步骤 5/6 色彩轮廓预计算失败: {exc}")
+            preheat_warn = True
+        _report(f"步骤 5/6 完成 ({time.perf_counter() - t0:.2f}s)")
+
+        # ── 第 6 步：analyze_fishing_bar 哑调用 ──
+        t0 = time.perf_counter()
+        _report("步骤 6/6: 预热耐力条分析管线（dummy call）...")
+        try:
+            self._preheat_analyze_fishing_bar()
+        except Exception as exc:
+            self._log(f"[预热] ⚠️ 耐力条管线预热失败: {exc}")
+            _report(f"⚠️ 步骤 6/6 耐力条管线预热失败: {exc}")
+            preheat_warn = True
+        _report(f"步骤 6/6 完成 ({time.perf_counter() - t0:.2f}s)")
+
+        if preheat_warn:
+            _report("⚠️ 部分预热步骤失败，首帧处理可能较慢")
         return name_ocr is not None and weight_ocr is not None and general_ocr is not None
+
+    def _preload_all_templates(self):
+        """预加载 TemplateResources 中所有模板 PNG 到 VisionCore 的缓存。"""
+        accessor_methods = [
+            self.tpl.f_button_templates,
+            self.tpl.initial_q_button_templates,
+            self.tpl.initial_e_button_templates,
+            self.tpl.initial_r_button_templates,
+            self.tpl.ready_start_button_templates,
+            self.tpl.ready_panel_templates,
+            self.tpl.hook_text_templates,
+            self.tpl.failed_text_templates,
+            self.tpl.weight_unit_templates,
+            self.tpl.success_close_prompt_templates,
+            self.tpl.success_exp_templates,
+            self.tpl.cursor_templates,
+            self.tpl.target_bar_templates,
+            self.tpl.auto_sell_fish_cabin_templates,
+            self.tpl.auto_sell_one_click_templates,
+            self.tpl.auto_sell_confirm_templates,
+        ]
+        total = 0
+        for accessor in accessor_methods:
+            for p in accessor():
+                self.vis._read_template(p)
+                total += 1
+        self._log(f"[预热] 已预加载 {total} 个模板文件。")
+
+    def _precompute_color_profiles(self):
+        """预计算耐力条分析所需的 HSV 色彩轮廓。"""
+        target_paths = self.tpl.target_bar_templates()
+        if target_paths:
+            self.vis._target_color_profile(target_paths)
+        cursor_paths = self.tpl.cursor_templates()
+        if cursor_paths:
+            self.vis._cursor_color_profile(cursor_paths)
+        self._log("[预热] HSV 色彩轮廓已缓存。")
+
+    def _preheat_analyze_fishing_bar(self):
+        """用合成小图像调用一次 analyze_fishing_bar，预热所有内部处理管线。"""
+        import numpy as _np
+        dummy_img = _np.zeros((20, 200, 3), dtype=_np.uint8)
+        cursor_paths = self.tpl.cursor_templates()
+        target_paths = self.tpl.target_bar_templates()
+        self.vis.analyze_fishing_bar(
+            dummy_img,
+            cursor_template_paths=cursor_paths,
+            cursor_color_reference_paths=cursor_paths,
+            target_color_reference_paths=target_paths,
+            cursor_scale_range=(0.5, 2.0),
+            cursor_scale_steps=5,
+            draw_debug=False,
+        )
+        self._log("[预热] analyze_fishing_bar 管线已预热。")
 
     def _run_loop(self):
         # 确保在当前线程中实例化 ScreenCapture
@@ -522,10 +646,7 @@ class StateMachine:
         now = time.time()
         text_img = self.sc.capture_relative(rect, *roi)
         if text_img is None: return
-        
-        # 每次重新抛竿后，重置 PID 控制器状态
-        self.pid.reset()
-        
+
         loc, conf, matched_path = self.vis.find_best_template(
             text_img,
             self.tpl.hook_text_templates(),
