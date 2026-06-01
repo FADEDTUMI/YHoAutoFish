@@ -3,6 +3,8 @@ from pathlib import Path
 
 import cv2
 
+from core.tracker import EventTracker
+
 
 class ResultDetector:
     """从 StateMachine 提取的结果检测相关方法集合。"""
@@ -452,6 +454,11 @@ class ResultDetector:
         strategy = (failed_info or {}).get("strategy") or "默认"
         self._sm._log(f"[{source_label}] 识别到\u201c鱼儿溜走了\u201d横幅 (置信度: {confidence:.2f}，模板: {matched_name}，策略: {strategy})！判定为钓鱼失败。")
         self._sm.ctrl.release_all()
+        round_duration = self.round_fishing_elapsed()
+        try:
+            EventTracker.get().fishing_failed("鱼儿溜走了", round_duration)
+        except Exception as exc:
+            import logging; logging.getLogger(__name__).debug("tracker.fishing_failed failed: %s", exc)
         self._sm._enter_recovering("识别到鱼儿溜走失败提示", record_empty=True, press_esc=False)
 
     def finish_empty_ready_result(self, ready_info, source_label="结算"):
@@ -639,6 +646,15 @@ class ResultDetector:
             self._sm.fish_count += 1
             self._sm._record_auto_sell_catch()
             self._sm.round.success_recorded_pending_close = True
+            round_duration = self.round_fishing_elapsed()
+            try:
+                rarity = ""
+                enc_entry = self._sm.record_mgr.get_encyclopedia().get(fish_name, {})
+                if isinstance(enc_entry, dict):
+                    rarity = enc_entry.get("rarity", "")
+                EventTracker.get().fishing_success(fish_name, weight_g, rarity, round_duration)
+            except Exception as exc:
+                import logging; logging.getLogger(__name__).debug("tracker.fishing_success failed: %s", exc)
             if getattr(self._sm, "_stop_requested", False):
                 return
 

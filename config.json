@@ -27,9 +27,9 @@
     "log_line_limit": 800,
     "auto_switch_to_log": true,
     "debug_mode": true,
-    "auto_sell_catch_threshold": 500,
+    "auto_sell_catch_threshold": 1,
     "monthly_card_daily_reset_enabled": true,
-    "monthly_card_daily_reset_last_date": "2026-05-19",
+    "monthly_card_daily_reset_last_date": "2026-05-26",
     "sponsor_button_hidden": false,
     "sponsor_qr_dir": "sponsor_qr"
 }

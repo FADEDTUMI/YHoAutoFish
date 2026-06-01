@@ -78,7 +78,23 @@ class ScreenCapture:
                 img = np.array(sct_img)[:, :, :3]
                 # mss grab 返回的 np.array 默认是只读的，如果要用 cv2 处理建议 copy
                 self._failure_count = 0
-                return np.copy(img)
+                result = np.copy(img)
+                try:
+                    from core.tracker import EventTracker
+                    tracker = EventTracker.get()
+                    cnt = getattr(tracker, "_fps_sample_counter", 0) + 1
+                    tracker._fps_sample_counter = cnt
+                    if cnt % 50 == 0:
+                        now_ts = time.monotonic()
+                        last_ts = getattr(tracker, "_fps_last_sample_ts", 0.0)
+                        if last_ts > 0:
+                            dt = now_ts - last_ts
+                            if dt > 0:
+                                tracker.perf_sample_fps(50.0 / dt)
+                        tracker._fps_last_sample_ts = now_ts
+                except Exception:
+                    pass
+                return result
             except mss.exception.ScreenShotError as e:
                 # SelectObject/BitBlt 失败通常意味着当前 mss/GDI 句柄已不稳定，立即重建后端并重试一次。
                 self._log_capture_error("mss 截图异常 (系统绘图失败)", e)

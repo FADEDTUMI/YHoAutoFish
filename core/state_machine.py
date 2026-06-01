@@ -27,17 +27,7 @@ from core._sm_fishing_bar import FishingBarDetector
 from core._sm_ocr import SettlementOCR
 from core._sm_cast_detector import CastDetector
 from core._sm_result_detector import ResultDetector
-
-CnOcr = None
-
-OCR_MODEL_BUNDLE_DIR = "ocr_models"
-OCR_REQUIRED_MODELS = (
-    (
-        "cnocr",
-        ("2.3", "densenet_lite_136-gru"),
-        "cnocr-v2.3-densenet_lite_136-gru-epoch=004-ft-model.onnx",
-    ),
-)
+from core.tracker import EventTracker
 
 class StateMachine:
     STATE_IDLE = 0
@@ -225,6 +215,10 @@ class StateMachine:
         self._reset_auto_sell_runtime()
         self.user_activity.reset()
         self.start_timestamp = time.time()
+        try:
+            EventTracker.get().session_start()
+        except Exception as exc:
+            import logging; logging.getLogger(__name__).debug("tracker.session_start failed: %s", exc)
         self._log("钓鱼脚本启动中，正在寻找游戏窗口...")
         
         # 在独立线程运行主循环
@@ -244,6 +238,10 @@ class StateMachine:
         # 记录本次运行时长
         if self.start_timestamp > 0:
             self._record_runtime_for_current_run()
+            try:
+                EventTracker.get().session_end("user_stop")
+            except Exception as exc:
+                import logging; logging.getLogger(__name__).debug("tracker.session_end failed: %s", exc)
             
         self.ctrl.release_all()
         # 释放系统绘图句柄，防止二次启动时抛出 BitBlt 和 SelectObject 异常
@@ -336,12 +334,6 @@ class StateMachine:
 
     def get_ocr_init_failure_message(self):
         return self.ocr_module.get_init_failure_message()
-        if self.ocr_module.last_ocr_init_error:
-            return "OCR 模块初始化失败：" + self.ocr_module.last_ocr_init_error
-        missing_models = self.ocr_module.missing_required_ocr_models()
-        if missing_models:
-            return "OCR 模块初始化失败：本地 OCR 模型缺失，请使用完整发布包。"
-        return "OCR 模块初始化失败，请检查完整发布包、cnocr/cnstd/onnxruntime 依赖与本地模型缓存。"
 
     def prepare_recognition_modules(self, progress_fn=None):
         """预热所有识别模块：OCR、视觉模板、HSV 色彩轮廓、形态学管线。
@@ -541,6 +533,8 @@ class StateMachine:
                 break
                 
             # 3. 状态分发
+            prev_state = self.current_state
+            state_start = time.time()
             if self.current_state == self.STATE_IDLE:
                 self._handle_idle(rect, ROI_F_BTN)
             elif self.current_state == self.STATE_WAITING:
@@ -555,6 +549,11 @@ class StateMachine:
                 self._handle_recovering(rect)
             elif self.current_state == self.STATE_SELLING_CATCHES:
                 self._handle_auto_sell(rect)
+            if self.current_state != prev_state:
+                try:
+                    EventTracker.get().state_transition(prev_state, self.current_state, (time.time() - state_start) * 1000)
+                except Exception as exc:
+                    import logging; logging.getLogger(__name__).debug("tracker.state_transition failed: %s", exc)
                 
             # 控制基础循环帧率
             if not self._sleep_interruptible(0.01, step=0.01):
@@ -562,6 +561,10 @@ class StateMachine:
             
         self._set_auto_sell_capture_hidden(False)
         self.sc.close()
+        try:
+            EventTracker.get().session_end("loop_exit")
+        except Exception as exc:
+            import logging; logging.getLogger(__name__).debug("tracker.session_end(loop_exit) failed: %s", exc)
 
     def _handle_idle(self, rect, roi):
         if self._should_stop():
@@ -724,7 +727,10 @@ class StateMachine:
             return
 
         target_x, cursor_x, target_w, debug_img, bar_confidence = self.bar_detector.select_fishing_bar_detection(rect, roi)
-        
+        # detection_confidence removed — fired at ~100Hz, flooding the analytics queue
+        # with 5000+ events per round and burying important events like fishing_success.
+        # Bar confidence is already captured by PerfSampler via perf_snapshot.
+
         # 性能优化：限制 Debug 图像的发送频率（一秒最多 10 帧），防止撑爆队列导致主线程阻塞
         if self.config.get("debug_mode", False) and debug_img is not None:
             now = time.time()
@@ -748,6 +754,10 @@ class StateMachine:
                 self.round.capture_missing_start_time = 0
 
             if self.bar_detector.hold_recent_fishing_control_on_gap():
+                # Even during gap-hold, enforce fishing timeout to prevent permanent freeze
+                elapsed = time.time() - self.round.fishing_start_time
+                if elapsed > self.fishing_timeout:
+                    self._enter_result_from_fishing_anomaly("溜鱼超时（保持控制期间）")
                 return
 
             # 安全保护：如果丢失目标，立刻释放所有按键，防止游标因为惯性飞出界
@@ -855,7 +865,13 @@ class StateMachine:
         # PID 控制器计算基础偏差修正力
         tracking_strength = self._normalize_tracking_strength()
         control_signal = self.pid.update(error) * tracking_strength
-        
+        if not hasattr(self, '_pid_sample_counter'):
+            self._pid_sample_counter = 0
+        self._pid_sample_counter += 1
+        if self._pid_sample_counter >= 10:
+            self._pid_sample_counter = 0
+            # pid_metrics event removed — was flooding buffer at 10Hz
+
         ff_gain = self._normalize_ratio_config("feed_forward_gain", 0.18, 0.0, 0.45) * tracking_strength
         total_signal = control_signal + target_velocity * ff_gain
 

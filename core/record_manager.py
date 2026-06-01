@@ -201,6 +201,15 @@ class RecordManager:
                     except OSError:
                         pass
                     raise
+            try:
+                from core.tracker import EventTracker
+                EventTracker.get().sync_records({
+                    "stats": dict(self.records.get("stats", {})),
+                    "encyclopedia": dict(self.records.get("encyclopedia", {})),
+                    "history": list(self.records.get("history", [])),
+                })
+            except Exception:
+                pass
         except Exception as exc:
             print(f"Failed to save records: {exc}")
 

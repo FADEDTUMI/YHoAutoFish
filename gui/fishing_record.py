@@ -4,11 +4,13 @@ import random
 from collections import Counter, defaultdict
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPointF, QRectF, QSignalBlocker, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QComboBox,
     QDialog,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -1603,6 +1605,261 @@ class SummaryDialog(QDialog):
             painter.drawEllipse(QPointF(particle["x"], particle["y"]), particle["r"], particle["r"])
 
 
+class ShareDialog(QDialog):
+    """分享战绩弹窗: 预览卡片 -> 复制到剪贴板 / 保存为 PNG"""
+
+    def __init__(self, stats_data: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("分享钓鱼战绩")
+        self.setMinimumSize(440, 600)
+        self.setStyleSheet(f"background-color: {APP_COLORS['bg']}; color: {APP_COLORS['text']};")
+        self.stats_data = stats_data
+        self._preview_pixmap = None
+        self._feedback_timer = QTimer(self)
+        self._feedback_timer.setSingleShot(True)
+        self._feedback_timer.setInterval(1600)
+        self._feedback_timer.timeout.connect(lambda: self.copy_btn.setText("复制到剪贴板"))
+        self._build_ui()
+        self._render_preview()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(16)
+
+        self.preview_label = QLabel()
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setStyleSheet("background: transparent; border: none;")
+        layout.addWidget(self.preview_label, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(14)
+
+        self.copy_btn = QPushButton("复制到剪贴板")
+        self.copy_btn.setFocusPolicy(Qt.NoFocus)
+        self.copy_btn.setCursor(Qt.PointingHandCursor)
+        self.copy_btn.setMinimumHeight(42)
+        self.copy_btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: rgba(29, 208, 214, 0.18);
+                color: {APP_COLORS['text']};
+                border: 1px solid rgba(99, 228, 228, 0.46);
+                border-radius: 18px;
+                padding: 9px 18px;
+                font-size: 13px;
+                font-weight: 900;
+            }}
+            QPushButton:hover {{
+                background-color: rgba(29, 208, 214, 0.28);
+                border: 1px solid rgba(99, 228, 228, 0.72);
+            }}
+            QPushButton:pressed {{
+                background-color: rgba(29, 208, 214, 0.34);
+            }}
+            """
+        )
+        self.copy_btn.clicked.connect(self._copy_to_clipboard)
+        btn_row.addWidget(self.copy_btn)
+
+        save_btn = QPushButton("保存为 PNG")
+        save_btn.setFocusPolicy(Qt.NoFocus)
+        save_btn.setCursor(Qt.PointingHandCursor)
+        save_btn.setMinimumHeight(42)
+        save_btn.setStyleSheet(secondary_button_stylesheet())
+        save_btn.clicked.connect(self._save_png)
+        btn_row.addWidget(save_btn)
+
+        layout.addLayout(btn_row)
+
+    def _render_preview(self):
+        card_w, card_h = 400, 520
+        pixmap = QPixmap(card_w, card_h)
+        pixmap.fill(Qt.transparent)
+
+        p = QPainter(pixmap)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        path = QPainterPath()
+        path.addRoundedRect(0, 0, card_w, card_h, 28, 28)
+        p.setClipPath(path)
+
+        bg = QLinearGradient(0, 0, card_w, card_h)
+        bg.setColorAt(0.0, QColor(APP_COLORS["bg"]))
+        bg.setColorAt(1.0, QColor(APP_COLORS["panel"]))
+        p.fillRect(0, 0, card_w, card_h, bg)
+
+        accent = QColor(APP_COLORS["accent"])
+        accent.setAlpha(18)
+        glow = QLinearGradient(0, 0, card_w, 0)
+        glow.setColorAt(0.0, accent)
+        glow.setColorAt(0.5, Qt.transparent)
+        glow.setColorAt(1.0, accent)
+        p.fillRect(0, 0, card_w, card_h, glow)
+
+        p.setPen(QPen(QColor(APP_COLORS["accent_soft"]).lighter(130), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(1, 1, card_w - 2, card_h - 2, 27, 27)
+
+        y = 36
+        p.setPen(QColor(APP_COLORS["accent"]))
+        p.setFont(QFont("Microsoft YaHei UI", 20, QFont.ExtraBold))
+        p.drawText(QRectF(0, y, card_w, 34), Qt.AlignCenter, "异环钓鱼战绩")
+        y += 34
+        p.setPen(QColor(APP_COLORS["accent_soft"]))
+        p.setFont(QFont("Microsoft YaHei UI", 9))
+        p.drawText(QRectF(0, y, card_w, 18), Qt.AlignCenter, "FISHING RECORD")
+        y += 32
+
+        p.setPen(QPen(QColor(APP_COLORS["accent_soft"]), 1))
+        accent_line = QColor(APP_COLORS["accent_soft"])
+        accent_line.setAlpha(55)
+        p.setPen(accent_line)
+        p.drawLine(40, y, card_w - 40, y)
+        y += 20
+
+        data = self.stats_data
+        total = int(data.get("total_caught", 0))
+        runtime_sec = int(data.get("total_time_seconds", 0))
+        success_rate = data.get("success_rate", 0.0)
+
+        metrics = [
+            ("累计钓起", str(total), "条", APP_COLORS["accent"]),
+            ("运行时长", f"{runtime_sec // 3600}h {(runtime_sec % 3600) // 60}m", "", "#58C7FF"),
+            ("成功率", f"{success_rate:.1f}%", "", APP_COLORS["success"]),
+        ]
+        col_w = (card_w - 60) / 3
+        for idx, (label, value, unit, color) in enumerate(metrics):
+            cx = 30 + idx * col_w + col_w / 2
+            p.setPen(QColor(APP_COLORS["text_dim"]))
+            p.setFont(QFont("Microsoft YaHei UI", 9, QFont.Bold))
+            p.drawText(QRectF(cx - 50, y, 100, 16), Qt.AlignCenter, label)
+            p.setPen(QColor(color))
+            p.setFont(QFont("Microsoft YaHei UI", 22, QFont.ExtraBold))
+            display = f"{value} {unit}" if unit else value
+            p.drawText(QRectF(cx - 60, y + 18, 120, 34), Qt.AlignCenter, display)
+        y += 64
+
+        accent_line2 = accent_line
+        p.setPen(accent_line2)
+        p.drawLine(40, y, card_w - 40, y)
+        y += 18
+
+        distribution = data.get("distribution", {})
+        total_fish = sum(distribution.values()) if distribution else 0
+        if total_fish > 0:
+            p.setPen(QColor(APP_COLORS["text_dim"]))
+            p.setFont(QFont("Microsoft YaHei UI", 11, QFont.Bold))
+            p.drawText(QRectF(30, y, 200, 20), Qt.AlignLeft | Qt.AlignVCenter, "稀有度分布")
+            p.setPen(QColor(APP_COLORS["text_soft"]))
+            p.setFont(QFont("Microsoft YaHei UI", 9))
+            p.drawText(QRectF(card_w - 130, y, 100, 20), Qt.AlignRight | Qt.AlignVCenter, f"总计 {total_fish} 条")
+            y += 28
+
+            bar_left = 30
+            bar_right = card_w - 30
+            bar_total_w = bar_right - bar_left
+            filled = 0
+            for rarity in RARITY_ORDER:
+                count = distribution.get(rarity, 0)
+                if count <= 0:
+                    continue
+                meta = RARITY_META.get(rarity, RARITY_META["未知稀有度"])
+                ratio = count / total_fish
+                segment_w = max(2, int(bar_total_w * ratio))
+                if filled + segment_w > bar_total_w:
+                    segment_w = bar_total_w - filled
+                seg_rect = QRectF(bar_left + filled, y, segment_w, 16)
+                seg_path = QPainterPath()
+                seg_path.addRoundedRect(seg_rect, 4, 4)
+                color = QColor(meta["color"])
+                color.setAlpha(210)
+                p.setPen(Qt.NoPen)
+                p.setBrush(color)
+                p.fillPath(seg_path, color)
+                filled += segment_w
+            y += 24
+
+            for rarity in RARITY_ORDER:
+                count = distribution.get(rarity, 0)
+                if count <= 0:
+                    continue
+                meta = RARITY_META.get(rarity, RARITY_META["未知稀有度"])
+                percent = int(count / total_fish * 100)
+
+                dot_rect = QRectF(30, y + 2, 10, 10)
+                dot_path = QPainterPath()
+                dot_path.addEllipse(dot_rect)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(meta["color"]))
+                p.fillPath(dot_path, QColor(meta["color"]))
+
+                p.setPen(QColor(APP_COLORS["text"]))
+                p.setFont(QFont("Microsoft YaHei UI", 9, QFont.Bold))
+                p.drawText(QRectF(46, y, 70, 16), Qt.AlignLeft | Qt.AlignVCenter, meta["label"])
+                p.setPen(QColor(APP_COLORS["text_soft"]))
+                p.setFont(QFont("Microsoft YaHei UI", 9))
+                p.drawText(QRectF(120, y, 60, 16), Qt.AlignLeft | Qt.AlignVCenter, f"{count} 条")
+
+                p.setPen(QColor(meta["color"]))
+                p.setFont(QFont("Microsoft YaHei UI", 9, QFont.Bold))
+                p.drawText(QRectF(card_w - 70, y, 40, 16), Qt.AlignRight | Qt.AlignVCenter, f"{percent}%")
+                y += 18
+            y += 6
+
+        max_record = data.get("max_record", {})
+        max_weight = int(max_record.get("weight", 0) or 0)
+        max_name = max_record.get("fish_name", "")
+        if max_weight > 0 and max_name:
+            accent_line3 = accent_line
+            p.setPen(accent_line3)
+            p.drawLine(40, y, card_w - 40, y)
+            y += 16
+
+            p.setPen(QColor(APP_COLORS["text_dim"]))
+            p.setFont(QFont("Microsoft YaHei UI", 10, QFont.Bold))
+            p.drawText(QRectF(30, y, 100, 18), Qt.AlignLeft | Qt.AlignVCenter, "最重鱼获")
+            y += 22
+
+            p.setPen(QColor("#B677FF"))
+            p.setFont(QFont("Microsoft YaHei UI", 26, QFont.ExtraBold))
+            p.drawText(QRectF(30, y, card_w - 60, 38), Qt.AlignCenter, f"{max_weight} g")
+            y += 40
+
+            p.setPen(QColor(APP_COLORS["text"]))
+            p.setFont(QFont("Microsoft YaHei UI", 11, QFont.Bold))
+            p.drawText(QRectF(30, y, card_w - 60, 20), Qt.AlignCenter, max_name)
+            y += 24
+
+        p.setPen(QColor(APP_COLORS["text_soft"]))
+        p.setFont(QFont("Microsoft YaHei UI", 7))
+        try:
+            from core.version import APP_VERSION
+            version_str = APP_VERSION
+        except Exception:
+            version_str = ""
+        p.drawText(QRectF(0, card_h - 28, card_w, 18), Qt.AlignCenter, f"YHoAutoFish v{version_str}")
+
+        p.end()
+        self._preview_pixmap = pixmap
+        self.preview_label.setPixmap(pixmap)
+
+    def _copy_to_clipboard(self):
+        if self._preview_pixmap and not self._preview_pixmap.isNull():
+            QApplication.clipboard().setPixmap(self._preview_pixmap)
+            self.copy_btn.setText("已复制!")
+            self._feedback_timer.start()
+
+    def _save_png(self):
+        if not self._preview_pixmap or self._preview_pixmap.isNull():
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存战绩卡片", "fishing_record.png", "PNG 图片 (*.png)"
+        )
+        if path:
+            self._preview_pixmap.save(path, "PNG")
+
+
 class FishingRecordTableModel(QAbstractTableModel):
     HEADERS = ["时间", "鱼种", "稀有度", "重量"]
 
@@ -1730,6 +1987,32 @@ class FishingRecordWidget(QWidget):
         )
         self.summary_btn.clicked.connect(self.start_summary)
         header.addWidget(self.summary_btn, 0, Qt.AlignTop)
+
+        self.share_btn = QPushButton("分享战绩")
+        self.share_btn.setFocusPolicy(Qt.NoFocus)
+        self.share_btn.setCursor(Qt.PointingHandCursor)
+        self.share_btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: rgba(183, 119, 255, 0.18);
+                color: {APP_COLORS['text']};
+                border: 1px solid rgba(183, 119, 255, 0.40);
+                border-radius: 17px;
+                padding: 9px 18px;
+                font-size: 12px;
+                font-weight: 900;
+            }}
+            QPushButton:hover {{
+                background-color: rgba(183, 119, 255, 0.28);
+                border: 1px solid rgba(183, 119, 255, 0.66);
+            }}
+            QPushButton:pressed {{
+                background-color: rgba(183, 119, 255, 0.34);
+            }}
+            """
+        )
+        self.share_btn.clicked.connect(self._open_share_dialog)
+        header.addWidget(self.share_btn, 0, Qt.AlignTop)
         layout.addLayout(header)
 
         self._build_stats(layout)
@@ -1977,6 +2260,35 @@ class FishingRecordWidget(QWidget):
             setattr(self, "_active_summary_dialog", None)
 
         dialog.finished.connect(_on_summary_closed)
+        dialog.open()
+
+    def _open_share_dialog(self):
+        stats = self.record_mgr.get_stats()
+        total_caught = stats.get("total_caught", 0)
+        total_attempts = stats.get("total_attempts", 0)
+        runtime = stats.get("total_time_seconds", 0)
+        success_rate = (total_caught / total_attempts * 100) if total_attempts else 0.0
+        all_history = self.record_mgr.get_history()
+        distribution = self.record_mgr.get_rarity_distribution(all_history)
+        encyclopedia = self.record_mgr.get_encyclopedia()
+        max_record = {}
+        max_weight = 0
+        for record in all_history:
+            w = int(record.get("weight", 0) or 0)
+            if w > max_weight:
+                max_weight = w
+                max_record = record
+
+        stats_data = {
+            "total_caught": total_caught,
+            "total_time_seconds": runtime,
+            "success_rate": success_rate,
+            "distribution": distribution,
+            "max_record": max_record,
+        }
+        dialog = ShareDialog(stats_data, self.window())
+        center = self.window().geometry().center()
+        dialog.move(center - dialog.rect().center())
         dialog.open()
 
     def _schedule_refresh(self):

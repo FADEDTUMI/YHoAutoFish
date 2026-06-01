@@ -59,6 +59,7 @@ from core.monthly_card_reset import (
     perform_double_escape_reset,
 )
 from core.state_machine import StateMachine
+from core.tracker import EventTracker
 from core.version import APP_AUTHOR, APP_DISPLAY_NAME, APP_REPOSITORY_URL, APP_VERSION
 from core.updater import DownloadCancelled, UpdateError, check_for_update, download_update, get_download_candidates, start_external_update
 from gui.encyclopedia import EncyclopediaWidget
@@ -917,59 +918,197 @@ class UpdateDownloadWorker(QThread):
                 self.completed.emit(False, "", str(exc))
 
 
+class StyledMessageDialog(QDialog):
+    """Themed message dialog matching app design language."""
+
+    def __init__(self, title, message, tone="info", parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        self.setWindowModality(Qt.ApplicationModal)
+        self.resize(440, 220)
+
+        border_color = {
+            "info": APP_COLORS['accent'],
+            "success": APP_COLORS['success'],
+            "warning": APP_COLORS['warning'],
+            "danger": APP_COLORS['danger'],
+        }.get(tone, APP_COLORS['accent'])
+
+        title_color = border_color
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 14, 14, 14)
+        outer.setSpacing(0)
+
+        shell = QFrame()
+        shell.setStyleSheet(f"""
+            QFrame {{
+                background-color: rgba(11, 22, 36, 0.98);
+                border: 1px solid {border_color};
+                border-radius: 28px;
+            }}
+        """)
+        add_shadow(shell, blur=32, alpha=120, offset=(0, 10))
+        outer.addWidget(shell)
+
+        layout = QVBoxLayout(shell)
+        layout.setContentsMargins(28, 22, 28, 22)
+        layout.setSpacing(14)
+
+        title_lbl = QLabel(title)
+        title_lbl.setStyleSheet(f"background:transparent; border:none; color:{title_color}; font-size:17px; font-weight:900;")
+        layout.addWidget(title_lbl)
+
+        msg_lbl = QLabel(message)
+        msg_lbl.setWordWrap(True)
+        msg_lbl.setStyleSheet(f"background:transparent; border:none; color:{APP_COLORS['text']}; font-size:13px;")
+        layout.addWidget(msg_lbl, 1)
+
+        ok_btn = QPushButton("确定")
+        ok_btn.setStyleSheet(primary_button_stylesheet())
+        ok_btn.setCursor(Qt.PointingHandCursor)
+        ok_btn.clicked.connect(self.accept)
+        layout.addWidget(ok_btn, 0, Qt.AlignRight)
+
+
 class ForceUpdateDialog(QDialog):
-    """Non-closeable forced update dialog shown when server requires minimum version."""
+    """Forced update dialog shown when server requires minimum version."""
 
     update_started = Signal()
 
     def __init__(self, min_version, update_url="", changelog="", parent=None):
         super().__init__(parent)
-        self.setWindowTitle("需要更新")
-        self.setMinimumWidth(420)
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowCloseButtonHint)
-        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        self._min_version = min_version
         self._update_url = update_url
+        self._dismissed = False
+        self._update_started = False
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        self.setWindowModality(Qt.ApplicationModal)
+        self.resize(520, 320)
 
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 14, 14, 14)
+        outer.setSpacing(0)
+
+        shell = QFrame()
+        shell.setStyleSheet(f"""
+            QFrame {{
+                background-color: rgba(11, 22, 36, 0.98);
+                border: 1px solid rgba(241, 190, 103, 0.42);
+                border-radius: 30px;
+            }}
+        """)
+        add_shadow(shell, blur=38, alpha=135, offset=(0, 14))
+        outer.addWidget(shell)
+
+        layout = QVBoxLayout(shell)
+        layout.setContentsMargins(28, 24, 28, 24)
         layout.setSpacing(12)
 
-        title = QLabel(f"当前版本过低，需要更新到 v{min_version} 或更高版本")
+        title = QLabel(f"⚠ 版本过低，需更新至 v{min_version} 或更高")
         title.setWordWrap(True)
-        title.setStyleSheet("font-size: 14px; font-weight: bold; color: #e74c3c;")
+        title.setStyleSheet(f"background:transparent; border:none; color:{APP_COLORS['warning']}; font-size:17px; font-weight:900;")
         layout.addWidget(title)
 
         if changelog:
-            log_label = QLabel("更新日志：")
-            log_label.setStyleSheet("font-weight: bold;")
-            layout.addWidget(log_label)
             log_text = QPlainTextEdit(changelog)
             log_text.setReadOnly(True)
-            log_text.setMaximumHeight(120)
+            log_text.setMaximumHeight(80)
+            log_text.setStyleSheet(f"""
+                QPlainTextEdit {{
+                    background-color: {APP_COLORS['panel']};
+                    color: {APP_COLORS['text']};
+                    border: 1px solid {APP_COLORS['stroke']};
+                    border-radius: 12px;
+                    padding: 10px;
+                    font-family: Consolas, 'Microsoft YaHei UI';
+                    font-size: 12px;
+                }}
+            """)
             layout.addWidget(log_text)
 
-        hint = QLabel("点击下方按钮自动下载并安装更新。")
+        hint = QLabel("点击「立即更新」自动下载安装，或点击「退出」关闭程序。")
         hint.setWordWrap(True)
+        hint.setStyleSheet(f"background:transparent; border:none; color:{APP_COLORS['text_dim']}; font-size:13px;")
         layout.addWidget(hint)
 
-        btn_layout = QHBoxLayout()
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(12)
         self.update_btn = QPushButton("立即更新")
-        self.update_btn.setStyleSheet("padding: 8px 24px; font-weight: bold;")
+        self.update_btn.setStyleSheet(primary_button_stylesheet())
+        self.update_btn.setCursor(Qt.PointingHandCursor)
         self.update_btn.clicked.connect(self._on_update)
-        btn_layout.addWidget(self.update_btn)
-        layout.addLayout(btn_layout)
+        btn_row.addWidget(self.update_btn)
+
+        self.exit_btn = QPushButton("退出程序")
+        self.exit_btn.setStyleSheet(secondary_button_stylesheet())
+        self.exit_btn.setCursor(Qt.PointingHandCursor)
+        self.exit_btn.clicked.connect(self._on_exit)
+        btn_row.addWidget(self.exit_btn)
+        layout.addLayout(btn_row)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
+        self.progress_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: {APP_COLORS['panel']};
+                border: 1px solid {APP_COLORS['stroke']};
+                border-radius: 8px; height: 16px;
+                text-align: center; color: {APP_COLORS['text']};
+                font-size: 11px;
+            }}
+            QProgressBar::chunk {{
+                background-color: {APP_COLORS['accent']};
+                border-radius: 7px;
+            }}
+        """)
         layout.addWidget(self.progress_bar)
 
         self.status_label = QLabel("")
         self.status_label.setVisible(False)
+        self.status_label.setStyleSheet(f"background:transparent; border:none; color:{APP_COLORS['text_dim']}; font-size:12px;")
         layout.addWidget(self.status_label)
 
         self._worker = None
 
+    def dismiss_dialog(self):
+        """Called when server disables force update -- close dialog gracefully."""
+        self._dismissed = True
+        self.done(QDialog.Accepted)
+
     def closeEvent(self, event):
-        event.ignore()
+        if self._dismissed:
+            event.accept()
+            return
+        reply = QMessageBox.question(
+            self, "确认退出",
+            "不更新将无法使用本工具。确定要退出程序吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            if self.parent():
+                self.parent().close()
+            else:
+                QApplication.instance().quit()
+            event.accept()
+        else:
+            event.ignore()
+
+    def _on_exit(self):
+        reply = QMessageBox.question(
+            self, "确认退出",
+            "确定要退出程序吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            if self.parent():
+                self.parent().close()
+            else:
+                QApplication.instance().quit()
 
     def _on_update(self):
         self.update_btn.setEnabled(False)
@@ -4035,6 +4174,17 @@ class AppWindow(QMainWindow):
         if getattr(self.auth_state, 'protocol_version', 1) >= 2 and self.auth_state.jwt_token:
             QTimer.singleShot(2000, self._start_websocket_worker)
 
+        # Preload OCR dependencies in background (takes ~13s due to torch/rapidocr import)
+        # so that recognition module initialization is near-instant when user starts fishing.
+        threading.Thread(target=self._preload_ocr_deps, daemon=True).start()
+
+    @staticmethod
+    def _preload_ocr_deps():
+        try:
+            from cnocr import CnOcr  # noqa: F401
+        except Exception:
+            pass
+
     def load_config(self):
         if not os.path.exists(CONFIG_FILE):
             return
@@ -4237,8 +4387,12 @@ class AppWindow(QMainWindow):
         """Start WebSocket worker for real-time revocation push."""
         if getattr(self, "_shutting_down", False):
             return
-        if self.auth_ws_worker is not None and self.auth_ws_worker.isRunning():
-            return
+        if self.auth_ws_worker is not None:
+            try:
+                if self.auth_ws_worker.isRunning():
+                    return
+            except RuntimeError:
+                self.auth_ws_worker = None
         if not self.auth_state.jwt_token:
             return
         license_id = str(getattr(self.auth_state, "license_id", "") or "")
@@ -4251,6 +4405,10 @@ class AppWindow(QMainWindow):
         self.auth_ws_worker.revoked.connect(self._handle_ws_revocation)
         self.auth_ws_worker.status_changed.connect(self._handle_ws_status_change)
         self.auth_ws_worker.finished.connect(self.auth_ws_worker.deleteLater)
+        self.auth_ws_worker.trigger_upgrade_received.connect(self._show_force_update_dialog)
+        self.auth_ws_worker.cancel_force_update_received.connect(self._dismiss_force_update_dialog)
+        self.auth_ws_worker.notification_received.connect(self._handle_ws_notification)
+        self.auth_ws_worker.force_disconnect_received.connect(self._handle_ws_force_disconnect)
         self.auth_ws_worker.start()
         self.write_log("[auth-ws] WebSocket 工作线程已启动")
 
@@ -4331,8 +4489,16 @@ class AppWindow(QMainWindow):
         # V2 WebSocket: update JWT or start WS if needed
         if getattr(self.auth_state, 'protocol_version', 1) >= 2 and self.auth_state.jwt_token:
             ws_worker = getattr(self, "auth_ws_worker", None)
-            if ws_worker is not None and ws_worker.isRunning():
-                ws_worker.update_jwt(self.auth_state.jwt_token)
+            if ws_worker is not None:
+                try:
+                    running = ws_worker.isRunning()
+                except RuntimeError:
+                    ws_worker = None
+                    running = False
+                if running:
+                    ws_worker.update_jwt(self.auth_state.jwt_token)
+                elif not getattr(self, "_shutting_down", False):
+                    QTimer.singleShot(1000, self._start_websocket_worker)
             elif not getattr(self, "_shutting_down", False):
                 QTimer.singleShot(1000, self._start_websocket_worker)
 
@@ -4458,7 +4624,35 @@ class AppWindow(QMainWindow):
         self._force_update_dialog_shown = True
         self.write_log(f"[强制升级] 服务端要求最低版本 v{min_version}，当前版本 v{APP_VERSION}")
         dlg = ForceUpdateDialog(min_version, update_url=update_url, changelog=changelog, parent=self)
-        dlg.exec()
+        self._force_update_dialog = dlg
+        def _cleanup():
+            self._force_update_dialog_shown = False
+            self._force_update_dialog = None
+        dlg.finished.connect(_cleanup)
+        dlg.show()
+
+    def _dismiss_force_update_dialog(self):
+        """Dismiss force update dialog when server disables force upgrade."""
+        dlg = getattr(self, "_force_update_dialog", None)
+        if dlg:
+            try:
+                dlg.dismiss_dialog()
+            except Exception as exc:
+                self.write_log(f"[强制升级] 关闭对话框异常: {exc}")
+
+    def _handle_ws_notification(self, message):
+        self.write_log(f"[通知] {message}")
+        StyledMessageDialog("服务端通知", message, tone="info", parent=self).exec()
+
+    def _handle_ws_force_disconnect(self, reason):
+        self.write_log(f"[强制下线] 原因: {reason}")
+        if hasattr(self, 'auth_ws_worker') and self.auth_ws_worker:
+            try:
+                self.auth_ws_worker.request_stop()
+            except RuntimeError:
+                pass
+        StyledMessageDialog("强制下线", f"管理员已将您强制下线。\n原因: {reason}", tone="danger", parent=self).exec()
+        self.close()
 
     def _show_auth_failure_toast(self, message, tone="danger"):
         key = str(message or "auth_failure")[:120]
@@ -4485,6 +4679,24 @@ class AppWindow(QMainWindow):
                 return
         if ok:
             self.auth_verified_this_session = True
+            # Initialize EventTracker after successful auth
+            try:
+                EventTracker.get().init(
+                    license_id=str(getattr(state, "license_id", "") or ""),
+                    app_version=APP_VERSION,
+                )
+                # Attach WS send function if already connected
+                ws_worker = getattr(self, "auth_ws_worker", None)
+                if ws_worker is not None:
+                    try:
+                        ws_fn = getattr(ws_worker, "_ws_send_fn", None)
+                        if ws_fn is not None:
+                            EventTracker.get().update_ws_fn(ws_fn)
+                    except Exception:
+                        pass
+                EventTracker.get().session_start()
+            except Exception:
+                pass
             if isinstance(result, dict) and _process_hosts_update(result):
                 state.cached_hosts = json.dumps(result.get("hosts", []))
             elif self.auth_state.cached_hosts:
@@ -4523,11 +4735,11 @@ class AppWindow(QMainWindow):
             # Force update check
             if isinstance(result, dict) and result.get("force_update"):
                 fu = result["force_update"]
-                QTimer.singleShot(500, lambda: self._show_force_update_dialog(
+                self._show_force_update_dialog(
                     fu.get("min_version", ""),
                     fu.get("update_url", ""),
                     fu.get("changelog", ""),
-                ))
+                )
             return
         recovery = classify_auth_recovery(self.auth_state, result or {}, network_error=network_error)
         is_v2 = getattr(self.auth_state, 'protocol_version', 1) >= 2
@@ -4804,6 +5016,10 @@ class AppWindow(QMainWindow):
             self.toast.reposition()
 
     def closeEvent(self, event):
+        try:
+            EventTracker.get().session_end("app_close")
+        except Exception:
+            pass
         self.shutdown_background_tasks()
         super().closeEvent(event)
 
@@ -6583,6 +6799,12 @@ class AppWindow(QMainWindow):
         if index == 1:
             self._ensure_encyclopedia_page()
         self.stack.setCurrentIndex(index)
+        # Track page view
+        _page_names = {0: "record", 1: "encyclopedia", 2: "log", 3: "settings"}
+        try:
+            EventTracker.get().ui_page_view(_page_names.get(index, f"page_{index}"))
+        except Exception:
+            pass
         if index == 0:
             self.page_record.refresh_data()
         elif index == 1:
@@ -6771,6 +6993,10 @@ class AppWindow(QMainWindow):
         self.sm.start()
         self.update_primary_buttons()
         self.show_toast("自动钓鱼已启动", "success")
+        try:
+            EventTracker.get().ui_click("start_fishing", "main")
+        except Exception:
+            pass
 
     def stop_bot(self):
         if not self.sm.is_running:
@@ -6780,6 +7006,10 @@ class AppWindow(QMainWindow):
         self.write_log(">>> 已发送停止指令。")
         self.update_ui_on_stop()
         self.show_toast("停止指令已发送", "warning")
+        try:
+            EventTracker.get().ui_click("stop_fishing", "main")
+        except Exception:
+            pass
 
     def update_ui_on_stop(self):
         self.status_chip.set_status("已停止", "stopped")

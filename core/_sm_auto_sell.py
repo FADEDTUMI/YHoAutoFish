@@ -321,7 +321,7 @@ class AutoSeller:
             return
 
         if step == "verify_ready":
-            ready_info = sm._detect_ready_to_cast(rect, allow_heavy=False, require_initial_controls=True)
+            ready_info = sm.cast_det.detect_ready_to_cast(rect, allow_heavy=False, require_initial_controls=True)
             if ready_info and ready_info.get("location"):
                 self.finish()
                 return

@@ -58,7 +58,8 @@ class AuthWSWorker(QThread):
     error = Signal(str)
     notification_received = Signal(str)
     force_disconnect_received = Signal(str)
-    trigger_upgrade_received = Signal(str)
+    trigger_upgrade_received = Signal(str, str, str)
+    cancel_force_update_received = Signal()
 
     def __init__(self, ws_url, jwt_token, license_id, parent=None):
         super().__init__(parent)
@@ -112,6 +113,12 @@ class AuthWSWorker(QThread):
                 self.status_changed.emit("connected")
                 delay_idx = 0
                 print("[auth-ws] Connected!")
+                self._ws_send_fn = ws.send
+                try:
+                    from core.tracker import EventTracker
+                    EventTracker.get().update_ws_fn(ws.send)
+                except Exception:
+                    pass
 
                 try:
                     ws.settimeout(35)
@@ -131,6 +138,12 @@ class AuthWSWorker(QThread):
                             break
                 finally:
                     ws.close()
+                    self._ws_send_fn = None
+                    try:
+                        from core.tracker import EventTracker
+                        EventTracker.get().update_ws_fn(None)
+                    except Exception:
+                        pass
 
             except Exception as exc:
                 err = str(exc) or type(exc).__name__
@@ -165,4 +178,8 @@ class AuthWSWorker(QThread):
             self._stop.set()
         elif event == "trigger_upgrade":
             min_version = str(data.get("min_version") or "")
-            self.trigger_upgrade_received.emit(min_version)
+            update_url = str(data.get("update_url") or "")
+            changelog = str(data.get("changelog") or "")
+            self.trigger_upgrade_received.emit(min_version, update_url, changelog)
+        elif event == "cancel_force_update":
+            self.cancel_force_update_received.emit()

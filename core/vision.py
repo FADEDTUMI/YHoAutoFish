@@ -248,8 +248,17 @@ class VisionCore:
                 h, w = best_match.shape[:2]
                 center_x = best_loc[0] + w // 2
                 center_y = best_loc[1] + h // 2
+                try:
+                    from core.tracker import EventTracker
+                    tracker = EventTracker.get()
+                    tracker._tpl_match_counter = getattr(tracker, "_tpl_match_counter", 0) + 1
+                    if tracker._tpl_match_counter % 100 == 0:
+                        template_name = os.path.basename(template_path) if template_path else ""
+                        tracker.template_match(template_name, best_val, 0.0, True)
+                except Exception:
+                    pass
                 return (center_x, center_y), best_val
-                
+
             return None, best_val
         except Exception as e:
             print(f"[Vision] Template matching error: {e}")

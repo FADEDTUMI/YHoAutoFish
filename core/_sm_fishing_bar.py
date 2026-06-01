@@ -185,6 +185,15 @@ class FishingBarDetector:
         now = time.time()
         last_valid_time = getattr(self._sm.round, "last_valid_bar_time", 0)
         if not last_valid_time or now - last_valid_time > 0.55:
+            self._sm.round._gap_hold_streak = 0
+            return False
+
+        # Limit consecutive gap-hold frames: dusk/warm backgrounds cause false
+        # cursor detections that refresh last_valid_bar_time indefinitely.
+        # After ~0.3s of continuous gap-hold, force release so missing_timeout can trigger.
+        streak = getattr(self._sm.round, "_gap_hold_streak", 0) + 1
+        self._sm.round._gap_hold_streak = streak
+        if streak > 30:  # ~0.3s at 100Hz loop rate
             return False
 
         current_direction = int(getattr(self._sm.round, "fish_control_direction", 0) or 0)
