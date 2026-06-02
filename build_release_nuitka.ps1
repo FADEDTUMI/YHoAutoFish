@@ -220,8 +220,8 @@ $NuitkArgs = @(
     "--include-data-files=config.json=config.json"
 )
 
-# Chinese-named directory (fish encyclopedia) - add if exists
-$FishDirName = "异环鱼类图鉴资源"
+# Fish encyclopedia resource directory
+$FishDirName = "fish_encyclopedia"
 $FishDirPath = Join-Path $ProjectRoot $FishDirName
 if (Test-Path -LiteralPath $FishDirPath) {
     $NuitkArgs += "--include-data-dir=${FishDirName}=${FishDirName}"
