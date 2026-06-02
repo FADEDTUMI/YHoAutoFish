@@ -16,7 +16,7 @@
     <img alt="No Injection" src="https://img.shields.io/badge/no%20injection-screen%20vision-1DD0D6?style=flat-square">
     <img alt="Admin" src="https://img.shields.io/badge/admin-required-FF667E?style=flat-square">
     <img alt="Local Data" src="https://img.shields.io/badge/data-local%20only-6FE39A?style=flat-square">
-    <img alt="Version" src="https://img.shields.io/badge/version-1.3.0-63E4E4?style=flat-square">
+    <img alt="Version" src="https://img.shields.io/badge/version-1.4.0-63E4E4?style=flat-square">
   </p>
 </div>
 
@@ -28,25 +28,30 @@ YHo AutoFish 仅用于图像识别、桌面自动化流程学习与个人技术�
 
 本程序开源免费发布。若你从付费渠道获得本程序，请立即停止付款，并优先从项目 Release 页面获取发布包。
 
-## 1.2.5 版本重点
+## 1.4.0 版本重点
 
-1.2.5 是基于 1.2.4 的稳定性更新，重点复核自动钓鱼主流程，移除自动购买鱼饵流程，并优化耐力条消失后的结算切换时机，避免误识别鱼饵不足提示后进入商店与恢复流程导致卡死。
+1.4.0 是一次重大升级：全新 v2 授权认证系统、全局埋点追踪、战绩分享、强制更新机制，同时切换至 Nuitka 编译打包以增强代码安全保护。
 
-- 新增月卡每日复位功能，可在设置中开启，按北京时间每日 05:02 执行一次双 ESC 复位。
-- 修复成功结算已记录后重复 ESC 可能退出钓鱼初始界面的问题，避免结算后进入错误上级界面导致卡死。
-- 优化耐力条消失后的结果切换时机：已稳定溜鱼且完成结果探测后可更快进入结算判定，同时保留短时断帧保护。
-- 移除鱼饵不足自动购买流程和对应设置入口；鱼饵不足时由游戏提示，用户手动补充或装备后再继续钓鱼。
-- 移除抛竿后鱼饵不足横幅探测，避免误识别后按 R 进入商店、恢复 ESC 退出到错误界面。
-- 优化标题栏群入口与赞助入口展示，赞助显示可在设置中关闭或重新开启。
-- 保留 1.2.4 对结算关闭、月卡复位和多分辨率流程的稳定性修复。
+- 全新 v2 JWT 认证系统，支持 token 刷新与多主机故障自动切换。
+- 新增 ECDSA-P256 离线 License 验证，断网场景下仍可正常运行。
+- 新增全局埋点追踪系统（EventTracker），支持离线 SQLite 队列与 WebSocket 实时上报。
+- 新增战绩分享功能，支持截图保存与一键复制。
+- 新增强制更新系统，支持 GitHub/Gitee 多源下载、分卷校验与 SHA256 验证。
+- 新增累计钓获自动售鱼功能，达到阈值后自动出售。
+- 新增极简结算模式，跳过结算界面识别直接进入下一轮，适合结算识别频繁出错的用户。
+- 新增消息中心，服务端通知不再弹窗阻断，收录在标题栏消息按钮中。
+- 新增游戏分辨率检查，非 1920×1080 分辨率启动时弹窗提醒效果无法保障。
+- 切换打包方案至 Nuitka standalone，代码经 C 编译保护，反逆向能力显著增强。
+- ESC 按键安全强化，全局防抖确保间隔 ≥300ms，自动售鱼两次 ESC 间隔 ≥1s。
+- 新增 11 种鱼类/收藏品适配（星斑鱼、海星、海中栗、金梭子、红/蓝/绿鳞旗、泡水的异象市民证、灯塔、黑夜蝠鲼、条纹椰），OCR 混淆字符表扩充。
 
-完整发布说明见 [release_notes_v1.2.5.md](release_notes_v1.2.5.md)。
+完整发布说明见 [release_notes_v1.4.0.md](release_notes_v1.4.0.md)。
 
 ## 下载与运行
 
 推荐使用 GitHub Release 中的压缩包，不需要自己配置 Python 环境。
 
-1. 下载 `YHoAutoFish-v1.3.0-windows.zip`。
+1. 下载 `YHoAutoFish-v1.4.0-windows.zip`。
 2. 解压到一个固定目录，不要直接在压缩包内运行。
 3. 打开《异环》，进入可以钓鱼的位置。
 4. 运行 `YHoAutoFish.exe`。
@@ -61,7 +66,7 @@ YHo AutoFish 仅用于图像识别、桌面自动化流程学习与个人技术�
 - 系统：Windows 10 或 Windows 11。
 - 游戏：保持《异环》窗口可见，不要最小化。
 - 权限：游戏和工具都建议以管理员权限运行；1.2 会自动请求管理员权限。
-- 显示：支持常见 1080p、2K、4K、高 DPI、窗口化和全屏场景；仍建议保持游戏 UI 不被遮挡。
+- 显示：推荐 1920×1080 分辨率，非推荐分辨率下识别效果无法保障；保持游戏 UI 不被遮挡。
 - 钓鱼点：角色站到钓鱼点，右下角能看到钓鱼交互提示。
 - 运行中：不要遮挡顶部溜鱼 HUD、右下角交互 UI、上钩提示和结算界面。
 
@@ -79,6 +84,8 @@ YHo AutoFish 仅用于图像识别、桌面自动化流程学习与个人技术�
 | 悬浮窗 | 支持展开/收起，显示状态和日志 |
 | 高级设置 | 按分类调整溜鱼、流程、识别、安全接管等参数 |
 | 在线更新 | 标题栏版本入口检查更新并一键安装 |
+| 极简结算模式 | 跳过结算识别直接进入下一轮，适合结算识别频繁出错的用户 |
+| 消息中心 | 标题栏消息按钮，服务端通知收录在下拉面板中，不再弹窗阻断 |
 
 ## 界面说明
 
@@ -147,7 +154,7 @@ YHo AutoFish 仅用于图像识别、桌面自动化流程学习与个人技术�
 
 自动检查和手动检查更新都会优先读取 GitHub 官方 `latest.json`；如果 GitHub 不可用或 GitHub 当前没有比本地更新的版本，会继续尝试 Gitee。Gitee 默认会先请求 `https://gitee.com/api/v5/repos/fadedtumi/YHoAutoFish/releases/latest` 获取最新发行版标签，再读取 `https://gitee.com/fadedtumi/YHoAutoFish/releases/download/{tag}/latest.json`。如果直链 `latest.json` 偶发返回 502，程序会继续尝试 Gitee Release 附件下载接口。`update_check_interval_minutes` 控制后台轮询间隔，建议保持 30 分钟或更长；手动检查始终立即执行。`update_download_urls`、`update_gitee_download_urls` 支持 `{version}`、`{tag}`、`{asset_name}` 占位符。即使使用备用下载源，程序仍会按 `latest.json` 中的 SHA256 校验更新包，校验失败会拒绝安装。
 
-Gitee 国内源使用连续分卷附件，例如 `YHoAutoFish-v1.3.0-windows.zip.001`、`.002`、`.003`。程序会自动下载所有分卷、校验 SHA256、合并为完整更新包并安装，普通用户不需要手动合并分卷。若下载过程中点击取消，程序会清理未完成的分卷、合并包和临时目录。
+Gitee 国内源使用连续分卷附件，例如 `YHoAutoFish-v1.4.0-windows.zip.001`、`.002`、`.003`。程序会自动下载所有分卷、校验 SHA256、合并为完整更新包并安装，普通用户不需要手动合并分卷。若下载过程中点击取消，程序会清理未完成的分卷、合并包和临时目录。
 
 ## 数据保存
 
@@ -155,6 +162,7 @@ Gitee 国内源使用连续分卷附件，例如 `YHoAutoFish-v1.3.0-windows.zip
 
 - `records.json`：捕获记录、图鉴解锁、统计数据。
 - `config.json`：高级设置与运行偏好。
+- `messages.json`：消息中心持久化存储。
 - `logs/`：更新器日志等运行日志。
 
 发布包不会内置作者测试记录。你可以备份 `records.json` 和 `config.json` 来保留自己的数据。
@@ -172,11 +180,11 @@ Gitee 国内源使用连续分卷附件，例如 `YHoAutoFish-v1.3.0-windows.zip
 | 鱼名或重量识别不准 | 保持结算界面无遮挡，必要时反馈调试截图 |
 | 检查更新失败 | 可稍后手动检查；国内网络可配置 `update_manifest_urls` / `update_download_urls` 作为备用源 |
 | 自动更新后数据还在吗 | 在受保护名单内的数据不会被覆盖 |
-| `py main.py` 提示缺少 `PySide6` | 当前 `py` 默认 Python 可能缺少依赖。入口脚本已指定 `python3.9`，也可以显式运行 `py -3.9 main.py` |
+| `py main.py` 提示缺少 `PySide6` | 当前 `py` 默认 Python 可能缺少依赖，可尝试 `py -3.12 main.py` 或在对应 Python 环境中安装 PySide6 |
 
 ## 发行文件说明
 
-普通用户只需要下载 `YHoAutoFish-v1.3.0-windows.zip`，解压后运行 `YHoAutoFish.exe`。
+普通用户只需要下载 `YHoAutoFish-v1.4.0-windows.zip`，解压后运行 `YHoAutoFish.exe`。
 
 GitHub Release 提供完整压缩包；Gitee Release 可能因附件体积限制提供 `.zip.001`、`.zip.002` 等分卷。分卷主要用于程序自动更新，手动下载安装时建议优先使用 GitHub 完整压缩包；如果只能使用 Gitee 分卷，请下载所有连续分卷后按文件名顺序合并为完整 zip 再解压。
 
@@ -192,4 +200,4 @@ GitHub Release 提供完整压缩包；Gitee Release 可能因附件体积限制
 
 - 作者：`FADEDTUMI`
 - 项目地址：`https://github.com/FADEDTUMI/YHoAutoFish`
-- 当前版本：`1.3.0`
+- 当前版本：`1.4.0`
