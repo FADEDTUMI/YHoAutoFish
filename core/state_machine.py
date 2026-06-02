@@ -8,7 +8,10 @@ import re
 import shutil
 import traceback
 from pathlib import Path
-from importlib import metadata
+try:
+    from importlib import metadata
+except ImportError:
+    metadata = None
 from PIL import Image, ImageDraw, ImageFont
 
 from core.window_manager import WindowManager
@@ -65,7 +68,8 @@ class StateMachine:
         self._auto_sell_last_log = 0
         self._auto_sell_ready_wait_started = 0
         self._auto_sell_capture_hidden = False
-        
+        self._last_esc_time = 0.0
+
         # 实例化真正的 PID 控制器
         # Kp: 比例，影响追赶速度
         # Ki: 积分，消除长期偏差（设为极小）
@@ -121,6 +125,14 @@ class StateMachine:
     def _should_stop(self):
         return bool(getattr(self, "_stop_requested", False) or not getattr(self, "is_running", False))
 
+    def _esc_safe_gap(self, min_gap=0.30):
+        """ESC按键防抖：确保距上次ESC至少min_gap秒，不足则sleep补足。"""
+        now = time.time()
+        elapsed = now - self._last_esc_time
+        if elapsed < min_gap:
+            time.sleep(min_gap - elapsed)
+            self._last_esc_time = time.time()
+
     def _tap_key_if_running(self, key, duration=0.01):
         with self._input_lock:
             if self._should_stop():
@@ -129,6 +141,8 @@ class StateMachine:
                 return False
             self._note_program_input((key,), duration=float(duration) + 0.45)
             self.ctrl.key_tap(key, duration=duration)
+            if key == 'esc':
+                self._last_esc_time = time.time()
             return True
 
     def _sleep_interruptible(self, seconds, step=0.05):
@@ -904,6 +918,33 @@ class StateMachine:
             return
         self._log("[结算] 正在检测钓鱼结果...")
 
+        # 极简模式：跳过结算识别，直接等待后进入下一轮
+        if self.config.get("minimal_settlement_mode", False):
+            self.ctrl.release_all()
+            wait_time = max(1.0, min(float(self.config.get("minimal_mode_wait", 2.5)), 5.0))
+            self._log(f"[结算] 极简模式：跳过结算识别，等待 {wait_time:.1f} 秒后继续...")
+            if not self._sleep_interruptible(wait_time):
+                return
+            self.record_mgr.add_catch_count_only()
+            self.fish_count += 1
+            self._record_auto_sell_catch()
+            started = getattr(self.round, "fishing_control_started_time", 0)
+            round_duration = (time.time() - started) if started > 0 else 0
+            try:
+                EventTracker.get().fishing_success("极简模式", 0, "", round_duration)
+            except Exception:
+                pass
+            self._esc_safe_gap(0.30)
+            if not self._tap_key_if_running('esc', duration=0.15):
+                return
+            close_delay = max(0.4, min(float(self.config.get("settlement_close_delay", 1)), 5.0))
+            if not self._sleep_interruptible(close_delay):
+                return
+            self._log(f"[结算] 极简模式：当前累计钓获: {self.fish_count} 条。")
+            self._reset_round_state()
+            self.current_state = self.STATE_IDLE
+            return
+
         max_attempts = 10 # 增加循环次数，但缩短每次的等待时间，实现更敏捷的响应
         if getattr(self.round, "success_recorded_pending_close", False):
             ready_info = self.cast_det.detect_ready_to_cast(rect, allow_heavy=False, require_initial_controls=True)
@@ -914,7 +955,7 @@ class StateMachine:
             now = time.time()
             close_delay = max(0.4, min(float(self.config.get("settlement_close_delay", 1)), 5.0))
             retry_count = int(getattr(self.round, "success_close_retry_count", 0))
-            if now - getattr(self.round, "success_close_last_esc", 0) >= max(0.75, close_delay):
+            if now - getattr(self.round, "success_close_last_esc", 0) >= max(0.75, close_delay, 0.30):
                 success_info = self.result_det.detect_success_settlement_still_visible(rect)
                 if success_info and retry_count < max_attempts:
                     self.result_det.finish_success_result(
@@ -1004,20 +1045,25 @@ class StateMachine:
 
         if getattr(self.round, "recovery_esc_requested", False) and not getattr(self.round, "recovery_esc_sent", False):
             self.ctrl.release_all()
+            self._esc_safe_gap(0.30)
             if not self._tap_key_if_running('esc', duration=0.15):
                 return
             self.round.recovery_esc_sent = True
+            self.round.recovery_first_esc_time = time.time()
             self._sleep_interruptible(0.35)
             return
 
+        first_esc_elapsed = now - getattr(self.round, "recovery_first_esc_time", 0) if getattr(self.round, "recovery_esc_sent", False) else 999
         if (
             getattr(self.round, "recovery_esc_requested", False)
             and getattr(self.round, "recovery_allow_second_esc", True)
             and elapsed >= 3.0
+            and first_esc_elapsed >= 1.0
             and not getattr(self.round, "recovery_second_esc_sent", False)
         ):
             self._log("[恢复] 暂未看到可抛钩提示，执行一次轻量 ESC 复位。")
             self.ctrl.release_all()
+            self._esc_safe_gap(0.30)
             if not self._tap_key_if_running('esc', duration=0.12):
                 return
             self.round.recovery_second_esc_sent = True

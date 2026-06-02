@@ -27,6 +27,17 @@ OCR_CONFUSABLE_CHARS = str.maketrans({
     "魯": "鱼",
     "鲁": "鱼",
     "食": "鱼",
+    # --- 繁简转换 ---
+    "鱗": "鳞",
+    "鯨": "鲸",
+    "燈": "灯",
+    "條": "条",
+    "鰻": "鳗",
+    "鰭": "鳍",
+    "鯛": "鲷",
+    "繡": "绣",
+    "鰠": "鳋",
+    "鳳": "凤",
 })
 
 
@@ -60,6 +71,7 @@ class RecordManager:
         self.load_records()
         if not self._load_failed:
             self._sync_encyclopedia_images()
+            self._ensure_thumbnail_cache()
             if self._migration_needed:
                 self.save_records()
 
@@ -465,6 +477,47 @@ class RecordManager:
         self._touch_cache()
         self.save_records()
 
+    def _ensure_thumbnail_cache(self):
+        """为缺失 .cache 缩略图的图鉴资源自动生成 160px 缩略图。"""
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            return
+        import logging
+        _log = logging.getLogger(__name__).debug
+        cache_size = 160
+        for fish_name, data in self.records.get("encyclopedia", {}).items():
+            image_path = data.get("image_path", "")
+            if not image_path or not os.path.exists(image_path):
+                continue
+            rarity_dir = os.path.dirname(image_path)
+            cache_dir = os.path.join(rarity_dir, ".cache")
+            cache_file = os.path.join(cache_dir, f"{fish_name}_{cache_size}.png")
+            if os.path.exists(cache_file):
+                continue
+            try:
+                # cv2.imread 不支持 Windows 中文路径，用 imdecode 替代
+                with open(image_path, "rb") as f:
+                    buf = np.frombuffer(f.read(), dtype=np.uint8)
+                img = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+                if img is None:
+                    continue
+                h, w = img.shape[:2]
+                if max(h, w) <= 0:
+                    continue
+                scale = cache_size / max(h, w)
+                new_w, new_h = int(w * scale), int(h * scale)
+                resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                os.makedirs(cache_dir, exist_ok=True)
+                # cv2.imwrite 同样不支持中文路径
+                ok, encoded = cv2.imencode(".png", resized)
+                if ok:
+                    with open(cache_file, "wb") as f:
+                        f.write(encoded.tobytes())
+            except Exception as exc:
+                _log("缩略图生成失败 [%s]: %s", fish_name, exc)
+
     def generate_sample_records(self):
         encyclopedia = {}
         for name, data in self._scan_resource_catalog().items():
@@ -602,6 +655,14 @@ class RecordManager:
             }
         )
 
+        self._touch_cache()
+        self.save_records()
+
+    def add_catch_count_only(self):
+        """极简模式：仅增加统计数据，不记录历史详情。"""
+        self.records["stats"]["total_caught"] += 1
+        self.records["stats"]["total_attempts"] += 1
+        self.records["stats"]["consecutive_empty"] = 0
         self._touch_cache()
         self.save_records()
 

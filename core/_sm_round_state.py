@@ -81,6 +81,7 @@ class RoundState:
         self.recovery_second_esc_sent = False
         self.recovery_allow_second_esc = True
         self.recovery_empty_recorded = False
+        self.recovery_first_esc_time = 0
 
     # ------------------------------------------------------------------
     #  完整重置（原 _reset_round_state）
@@ -194,3 +195,4 @@ class RoundState:
         self.recovery_second_esc_sent = False
         self.recovery_allow_second_esc = True
         self.recovery_empty_recorded = False
+        self.recovery_first_esc_time = 0

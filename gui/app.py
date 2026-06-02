@@ -236,6 +236,13 @@ class TitleButton(QPushButton):
         elif self.kind == "close":
             painter.drawLine(int(cx - 5), int(cy - 5), int(cx + 5), int(cy + 5))
             painter.drawLine(int(cx + 5), int(cy - 5), int(cx - 5), int(cy + 5))
+        elif self.kind == "message":
+            # 信封图标
+            env_l, env_t = int(cx - 7), int(cy - 5)
+            env_w, env_h = 14, 10
+            painter.drawRoundedRect(env_l, env_t, env_w, env_h, 2, 2)
+            painter.drawLine(env_l, env_t, int(cx), int(cy + 1))
+            painter.drawLine(env_l + env_w, env_t, int(cx), int(cy + 1))
 
 
 class PulseTitleActionButton(QPushButton):
@@ -738,6 +745,18 @@ class CustomTitleBar(QFrame):
         self.btn_coffee = PulseTitleActionButton("coffee", "请作者喝一点咖啡吗？", "coffee", has_close=True)
         self.btn_qq = PulseTitleActionButton("qq", "Q群", "purple")
         self.btn_auth = PulseTitleActionButton("auth", "未授权", "auth_bad", auto_width=True, min_width=92)
+        self.btn_message = TitleButton("message", "rgba(29, 208, 214, 0.18)")
+        self.btn_message.setToolTip("消息中心")
+        self.btn_message.setFixedSize(46, 34)
+        # 红点
+        self.msg_dot = QWidget(self.btn_message)
+        self.msg_dot.setFixedSize(8, 8)
+        self.msg_dot.setStyleSheet(
+            "background: #FF667E; border-radius: 4px; border: none;"
+        )
+        self.msg_dot.move(32, 4)
+        self.msg_dot.setVisible(False)
+        self.btn_message.clicked.connect(self.window_ref.toggle_message_panel)
         self.btn_min = TitleButton("min", "rgba(90, 129, 166, 0.22)")
         self.btn_max = TitleButton("max", "rgba(90, 129, 166, 0.22)")
         self.btn_close = TitleButton("close", "rgba(255, 102, 126, 0.58)")
@@ -758,6 +777,7 @@ class CustomTitleBar(QFrame):
         layout.addWidget(self.btn_coffee)
         layout.addWidget(self.btn_qq)
         layout.addWidget(self.btn_auth)
+        layout.addWidget(self.btn_message)
         layout.addWidget(self.btn_about)
         layout.addWidget(self.btn_min)
         layout.addWidget(self.btn_max)
@@ -802,6 +822,142 @@ class CustomTitleBar(QFrame):
         else:
             text, tone, tooltip = "未授权", "auth_bad", "查看来源验证状态"
         self.btn_auth.set_label(text, tone=tone, tooltip=tooltip)
+
+
+class MessageDropdownPanel(QWidget):
+    """消息中心下拉面板，点击消息按钮后弹出。"""
+
+    def __init__(self, message_store, parent=None):
+        super().__init__(parent)
+        self._store = message_store
+        self.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedWidth(360)
+        self.setMaximumHeight(400)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(0)
+
+        shell = QFrame()
+        shell.setStyleSheet(
+            """
+            QFrame {
+                background-color: rgba(15, 27, 43, 0.98);
+                border: 1px solid rgba(41, 66, 94, 0.72);
+                border-radius: 18px;
+            }
+            """
+        )
+        add_shadow(shell, blur=28, alpha=110, offset=(0, 8))
+        root.addWidget(shell)
+
+        layout = QVBoxLayout(shell)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(10)
+
+        # 标题栏
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        title = QLabel("消息中心")
+        title.setStyleSheet(
+            f"background: transparent; border: none; color: {APP_COLORS['text']}; font-size: 16px; font-weight: 800;"
+        )
+        header.addWidget(title)
+        header.addStretch()
+        read_all_btn = QPushButton("全部已读")
+        read_all_btn.setFocusPolicy(Qt.NoFocus)
+        read_all_btn.setCursor(Qt.PointingHandCursor)
+        read_all_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: none; color: {APP_COLORS['accent']}; font-size: 12px; font-weight: 700; }}"
+            f"QPushButton:hover {{ color: {APP_COLORS['accent_soft']}; }}"
+        )
+        read_all_btn.clicked.connect(self._mark_all_read)
+        header.addWidget(read_all_btn)
+        layout.addLayout(header)
+
+        # 消息列表（可滚动）
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollBar:vertical { width: 4px; background: transparent; }"
+            "QScrollBar::handle:vertical { background: rgba(29,208,214,0.3); border-radius: 2px; min-height: 20px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+        )
+        self._list_widget = QWidget()
+        self._list_widget.setStyleSheet("background: transparent; border: none;")
+        self._list_layout = QVBoxLayout(self._list_widget)
+        self._list_layout.setContentsMargins(0, 0, 0, 0)
+        self._list_layout.setSpacing(6)
+        self._list_layout.addStretch()
+        self._scroll.setWidget(self._list_widget)
+        layout.addWidget(self._scroll, 1)
+
+        self._refresh_messages()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._refresh_messages()
+        self._store.mark_all_read()
+        # 通知父窗口隐藏红点
+        parent = self.parent()
+        if parent and hasattr(parent, "title_bar"):
+            dot = getattr(parent.title_bar, "msg_dot", None)
+            if dot:
+                dot.setVisible(False)
+
+    def _mark_all_read(self):
+        self._store.mark_all_read()
+        self._refresh_messages()
+        parent = self.parent()
+        if parent and hasattr(parent, "title_bar"):
+            dot = getattr(parent.title_bar, "msg_dot", None)
+            if dot:
+                dot.setVisible(False)
+
+    def _refresh_messages(self):
+        # 清空旧内容
+        while self._list_layout.count() > 1:  # 保留最后的 stretch
+            item = self._list_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        messages = self._store.get_messages()
+        if not messages:
+            empty = QLabel("暂无消息")
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setStyleSheet(
+                f"background: transparent; border: none; color: {APP_COLORS['text_soft']}; font-size: 13px; padding: 30px 0;"
+            )
+            self._list_layout.insertWidget(self._list_layout.count() - 1, empty)
+            return
+
+        for msg in reversed(messages):  # 最新在上
+            row = QFrame()
+            row.setStyleSheet(
+                f"QFrame {{ background: {'rgba(29,208,214,0.06)' if not msg.get('read') else 'transparent'}; "
+                f"border: none; border-radius: 10px; padding: 8px 10px; }}"
+            )
+            row_layout = QVBoxLayout(row)
+            row_layout.setContentsMargins(8, 6, 8, 6)
+            row_layout.setSpacing(3)
+
+            time_label = QLabel(msg.get("time", ""))
+            time_label.setStyleSheet(
+                f"background: transparent; border: none; color: {APP_COLORS['text_soft']}; font-size: 11px;"
+            )
+            row_layout.addWidget(time_label)
+
+            text_label = QLabel(msg.get("text", ""))
+            text_label.setWordWrap(True)
+            text_label.setStyleSheet(
+                f"background: transparent; border: none; color: {APP_COLORS['text']}; font-size: 13px;"
+            )
+            row_layout.addWidget(text_label)
+
+            self._list_layout.insertWidget(self._list_layout.count() - 1, row)
 
 
 class StatusChip(QLabel):
@@ -1120,7 +1276,11 @@ class ForceUpdateDialog(QDialog):
         try:
             from core.updater import UpdateInfo, check_for_update
             if self._update_url:
-                info = UpdateInfo(version="", url=self._update_url, asset_name="", body="")
+                info = UpdateInfo(
+                    version="", tag_name="", release_name="",
+                    body="", asset_name="",
+                    download_url=self._update_url, html_url="",
+                )
                 source = "direct"
             else:
                 info = check_for_update(timeout=10)
@@ -1146,8 +1306,8 @@ class ForceUpdateDialog(QDialog):
     def _on_completed(self, ok, path, error):
         if ok and path:
             self.status_label.setText("下载完成，正在启动安装...")
-            import subprocess
-            subprocess.Popen([path])
+            from core.updater import start_external_update
+            start_external_update(path, main_pid=os.getpid())
         else:
             self.status_label.setText(f"下载失败: {error}")
             self.update_btn.setEnabled(True)
@@ -3014,13 +3174,13 @@ class LowResolutionWarningDialog(QDialog):
         layout.setContentsMargins(30, 26, 30, 24)
         layout.setSpacing(16)
 
-        title = QLabel("游戏分辨率偏低")
+        title = QLabel("分辨率提示")
         title.setStyleSheet(
             f"background: transparent; border: none; color: {APP_COLORS['text']}; font-size: 30px; font-weight: 900;"
         )
         layout.addWidget(title)
 
-        subtitle = QLabel(f"当前识别到的游戏客户区分辨率为 {width} × {height}，低于建议的 {min_width} × {min_height}。")
+        subtitle = QLabel(f"当前游戏客户区分辨率为 {width} × {height}，不是推荐的 {min_width} × {min_height}。")
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet(
             f"background: transparent; border: none; color: {APP_COLORS['accent_soft']}; font-size: 14px; font-weight: 800;"
@@ -3028,8 +3188,9 @@ class LowResolutionWarningDialog(QDialog):
         layout.addWidget(subtitle)
 
         body = QLabel(
-            "分辨率过低时，右下角交互图标、上钩文字、溜鱼耐力条和结算文字会占用更少像素，"
+            "非推荐分辨率下，右下角交互图标、上钩文字、溜鱼耐力条和结算文字的像素占比会发生变化，"
             "识别容错会明显下降，可能出现抛竿识别慢、溜鱼跟随不稳、结算识别失败或失败后恢复变慢。"
+            "效果无法保障，建议使用 1920 × 1080 分辨率。"
         )
         body.setWordWrap(True)
         body.setStyleSheet(
@@ -3037,7 +3198,7 @@ class LowResolutionWarningDialog(QDialog):
         )
         layout.addWidget(body)
 
-        advice = QLabel("建议先把游戏窗口或全屏分辨率调高到 1600 × 900 或以上，再开始自动钓鱼。")
+        advice = QLabel("建议将游戏窗口或全屏分辨率调整为 1920 × 1080，再开始自动钓鱼。")
         advice.setWordWrap(True)
         advice.setStyleSheet(
             """
@@ -4642,7 +4803,13 @@ class AppWindow(QMainWindow):
 
     def _handle_ws_notification(self, message):
         self.write_log(f"[通知] {message}")
-        StyledMessageDialog("服务端通知", message, tone="info", parent=self).exec()
+        store = getattr(self, "_message_store", None)
+        if store:
+            store.add_message(message, "notification")
+        dot = getattr(self.title_bar, "msg_dot", None)
+        if dot:
+            dot.setVisible(True)
+        self.show_toast("收到新消息", "info")
 
     def _handle_ws_force_disconnect(self, reason):
         self.write_log(f"[强制下线] 原因: {reason}")
@@ -4887,6 +5054,8 @@ class AppWindow(QMainWindow):
         self.sm.update_config("user_takeover_start_grace", self.config.get("user_takeover_start_grace", 1.20))
         self.sm.update_config("debug_mode", self.config.get("debug_mode", False))
         self.sm.update_config("auto_sell_catch_threshold", self.config.get("auto_sell_catch_threshold", 0))
+        self.sm.update_config("minimal_settlement_mode", self.config.get("minimal_settlement_mode", False))
+        self.sm.update_config("minimal_mode_wait", self.config.get("minimal_mode_wait", 2.5))
 
     def _refresh_debug_view_state(self):
         if not hasattr(self, "debug_preview"):
@@ -4938,6 +5107,13 @@ class AppWindow(QMainWindow):
 
         self.title_bar = CustomTitleBar(self)
         shell_layout.addWidget(self.title_bar)
+
+        # 消息中心
+        from core.message_store import MessageStore
+        self._message_store = MessageStore()
+        self._message_panel = MessageDropdownPanel(self._message_store, parent=self)
+        if self._message_store.has_unread():
+            self.title_bar.msg_dot.setVisible(True)
 
         content = QWidget()
         content.setStyleSheet(
@@ -5098,6 +5274,24 @@ class AppWindow(QMainWindow):
         dialog = self.about_dialog
         dialog.move(self.geometry().center() - dialog.rect().center())
         dialog.open()
+
+    def toggle_message_panel(self):
+        panel = getattr(self, "_message_panel", None)
+        if panel is None:
+            return
+        if panel.isVisible():
+            panel.hide()
+            return
+        btn = self.title_bar.btn_message
+        # 按钮左下角的屏幕坐标
+        global_pos = btn.mapToGlobal(QPoint(0, btn.height()))
+        # 确保面板不超出窗口右边界（用屏幕坐标计算）
+        win_geo = self.geometry()
+        x = max(win_geo.left() + 8, min(global_pos.x(), win_geo.right() - panel.width() - 8))
+        y = global_pos.y() + 4
+        panel.move(x, y)
+        panel.show()
+        panel.raise_()
 
     def show_qq_group_dialog(self):
         self.qq_group_dialog = QQGroupDialog(self)
@@ -6088,6 +6282,29 @@ class AppWindow(QMainWindow):
             config_decimals=2,
         )
         recognition_keys.append("empty_ready_confirm_delay")
+        self.minimal_mode_button = self._settings_toggle_block(
+            recognition_layout,
+            "极简结算模式",
+            "开启后，钓鱼成功时跳过结算界面识别（OCR + 模板匹配），等待片刻后直接进入下一轮。适合结算识别频繁出错的用户。",
+            self.config.get("minimal_settlement_mode", False),
+            "minimal_settlement_mode",
+        )
+        recognition_keys.append("minimal_settlement_mode")
+        self.slider_minimal_mode_wait = self._settings_block(
+            recognition_layout,
+            "极简模式等待时长",
+            "极简模式下跳过结算识别后的等待时间。太短可能导致游戏界面未就绪。",
+            self.config.get("minimal_mode_wait", 2.5),
+            10,
+            50,
+            "minimal_mode_wait",
+            value_scale=0.1,
+            display_scale=0.1,
+            display_suffix="s",
+            display_decimals=1,
+            config_decimals=1,
+        )
+        recognition_keys.append("minimal_mode_wait")
         recognition_layout.addStretch()
         self._add_settings_category("识别与判定", recognition_page, recognition_keys)
 
@@ -6942,8 +7159,7 @@ class AppWindow(QMainWindow):
         dialog.activateWindow()
 
     def _confirm_game_resolution_before_start(self):
-        min_width = 1600
-        min_height = 900
+        TARGET_W, TARGET_H = 1920, 1080
 
         if not self.sm.wm.find_window():
             return True
@@ -6953,22 +7169,22 @@ class AppWindow(QMainWindow):
             return True
 
         left, top, width, height = rect
-        if width >= min_width and height >= min_height:
+        if width == TARGET_W and height == TARGET_H:
             return True
 
-        dialog = LowResolutionWarningDialog(width, height, min_width, min_height, self)
+        dialog = LowResolutionWarningDialog(width, height, TARGET_W, TARGET_H, self)
         dialog.move(int(left + width / 2 - dialog.width() / 2), int(top + height / 2 - dialog.height() / 2))
         result = dialog.exec()
         if result == QDialog.Accepted:
             self.write_log(
-                f"[系统] 当前游戏客户区分辨率 {width}x{height} 低于建议的 {min_width}x{min_height}，用户选择继续启动。"
+                f"[系统] 当前游戏客户区分辨率 {width}x{height} 不是推荐的 {TARGET_W}x{TARGET_H}，用户选择继续启动。"
             )
             return True
 
         self.write_log(
-            f"[系统] 当前游戏客户区分辨率 {width}x{height} 低于建议的 {min_width}x{min_height}，已取消启动。"
+            f"[系统] 当前游戏客户区分辨率 {width}x{height} 不是推荐的 {TARGET_W}x{TARGET_H}，已取消启动。"
         )
-        self.show_toast("已取消启动，请先调高游戏分辨率", "warning")
+        self.show_toast("已取消启动，请先调整游戏分辨率为 1920×1080", "warning")
         return False
 
     def start_bot(self):

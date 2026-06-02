@@ -633,6 +633,34 @@ class ResultDetector:
         if getattr(self._sm, "_stop_requested", False):
             return
         self.clear_failed_result_candidate()
+
+        # 极简模式：跳过OCR识别，仅计数
+        if self._sm.config.get("minimal_settlement_mode", False):
+            if not getattr(self._sm.round, "success_recorded_pending_close", False):
+                self._sm.ctrl.release_all()
+                self._sm.record_mgr.add_catch_count_only()
+                self._sm.fish_count += 1
+                self._sm._record_auto_sell_catch()
+                self._sm.round.success_recorded_pending_close = True
+                round_duration = self.round_fishing_elapsed()
+                try:
+                    EventTracker.get().fishing_success("极简模式", 0, "", round_duration)
+                except Exception:
+                    pass
+                self._sm._log(f"[{source_label}] 极简模式：跳过结算识别。当前累计钓获: {self._sm.fish_count} 条。")
+            wait_time = max(1.0, min(float(self._sm.config.get("minimal_mode_wait", 2.5)), 5.0))
+            if not self._sm._sleep_interruptible(wait_time):
+                return
+            self._sm._esc_safe_gap(0.30)
+            if not self._sm._tap_key_if_running('esc', duration=0.15):
+                return
+            close_delay = max(0.4, min(float(self._sm.config.get("settlement_close_delay", 1)), 5.0))
+            if not self._sm._sleep_interruptible(close_delay):
+                return
+            self._sm._reset_round_state()
+            self._sm.current_state = self._sm.STATE_IDLE
+            return
+
         if not getattr(self._sm.round, "success_recorded_pending_close", False):
             self._sm._log(f"[{source_label}] 识别到成功结算组合特征 (综合置信度: {success_info['confidence']:.2f}，{self.format_success_signals(success_info)})，开始识别鱼类信息...")
 
@@ -662,6 +690,7 @@ class ResultDetector:
         else:
             self._sm._log(f"[结算] 本次成功结算已记录，继续尝试 ESC 关闭结算界面 (尝试 {attempt}/{max_attempts})...")
 
+        self._sm._esc_safe_gap(0.30)
         if not self._sm._tap_key_if_running('esc', duration=0.15):
             return
         self._sm.round.success_close_retry_count = max(int(getattr(self._sm.round, "success_close_retry_count", 0)), int(attempt))

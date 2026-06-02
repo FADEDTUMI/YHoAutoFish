@@ -176,6 +176,7 @@ class AutoSeller:
                 rect, allow_heavy=False, require_initial_controls=True
             ) if rect else None
             if not (ready_info and ready_info.get("location")):
+                self._sm._esc_safe_gap(0.30)
                 self._sm._tap_key_if_running("esc", duration=0.12)
         self.session_catch_count = 0
         self.pending = False
@@ -303,8 +304,9 @@ class AutoSeller:
             return
 
         if step == "wait_after_confirm":
-            if step_elapsed < 2.0:
+            if step_elapsed < 3.0:
                 return
+            self._sm._esc_safe_gap(0.30)
             if not sm._tap_key_if_running("esc", duration=0.12):
                 return
             sm._log("[售鱼] 已发送第一次 ESC，准备退出售鱼界面。")
@@ -312,8 +314,9 @@ class AutoSeller:
             return
 
         if step == "second_esc":
-            if step_elapsed < 0.45:
+            if step_elapsed < 1.0:
                 return
+            self._sm._esc_safe_gap(0.30)
             if not sm._tap_key_if_running("esc", duration=0.12):
                 return
             sm._log("[售鱼] 已发送第二次 ESC，正在确认回到钓鱼初始界面。")

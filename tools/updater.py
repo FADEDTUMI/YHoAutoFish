@@ -779,6 +779,12 @@ def perform_update(args, reporter):
         copied, skipped = apply_payload(payload_root, app_dir, runner_path=runner_path, progress_callback=on_copy)
         log(app_dir, f"文件覆盖完成，复制 {copied} 个文件，跳过用户数据 {skipped} 个文件")
 
+        # Clean up PyInstaller leftovers after migrating to Nuitka
+        legacy_internal = app_dir / "_internal"
+        if legacy_internal.is_dir():
+            shutil.rmtree(legacy_internal, ignore_errors=True)
+            log(app_dir, "已清理旧版 PyInstaller _internal 目录")
+
         reporter.phase("正在清理临时文件", 96, "正在清理下载包和临时解压目录。")
         remove_if_update_download(package, app_dir)
         shutil.rmtree(extract_root, ignore_errors=True)

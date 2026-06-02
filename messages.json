@@ -1,0 +1,19 @@
+{
+  "messages": [
+    {
+      "id": 1,
+      "time": "2026-06-01 19:03:17",
+      "text": "123123",
+      "read": true,
+      "type": "notification"
+    },
+    {
+      "id": 2,
+      "time": "2026-06-01 19:03:31",
+      "text": "HELLO",
+      "read": true,
+      "type": "notification"
+    }
+  ],
+  "next_id": 3
+}

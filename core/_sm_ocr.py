@@ -111,11 +111,12 @@ class SettlementOCR:
 
     def package_version(self, package_name):
         try:
-            return metadata.version(package_name)
-        except metadata.PackageNotFoundError:
-            return "未安装"
+            ver = metadata.version(package_name)
+            if ver == "0.0.0":
+                return "N/A"
+            return ver
         except Exception:
-            return "未知"
+            return "未安装"
 
     # ------------------------------------------------------------------
     # OCR 运行时路径准备

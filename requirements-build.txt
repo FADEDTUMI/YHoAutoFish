@@ -1,3 +1,6 @@
 pyinstaller>=6.20.0
 pyarmor>=9.2.0,<9.3
 pillow>=10.0.0
+nuitka>=4.1.0
+ordered-set
+zstandard

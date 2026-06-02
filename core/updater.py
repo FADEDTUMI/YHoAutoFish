@@ -1387,7 +1387,7 @@ def download_update(update_info, progress_callback=None, timeout=25, source=UPDA
 
     # Direct URL download: bypass GitHub/Gitee candidates
     if str(source or "").strip().lower() == "direct":
-        direct_url = str(getattr(update_info, "url", "") or "").strip()
+        direct_url = str(getattr(update_info, "download_url", "") or "").strip()
         if not direct_url:
             raise UpdateError("直连下载地址为空")
         download_root = _update_subdir(UPDATE_DOWNLOAD_DIR_NAME)
