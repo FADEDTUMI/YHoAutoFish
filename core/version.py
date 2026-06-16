@@ -1,8 +1,8 @@
 APP_NAME = "YHoAutoFish"
 APP_DISPLAY_NAME = "异环自动钓鱼"
-APP_VERSION = "1.4.0"
-APP_VERSION_FILE = "1.4.0.0"
-APP_VERSION_TUPLE = (1, 4, 0, 0)
+APP_VERSION = "1.4.2"
+APP_VERSION_FILE = "1.4.2.0"
+APP_VERSION_TUPLE = (1, 4, 2, 0)
 APP_AUTHOR = "FADEDTUMI"
 APP_REPOSITORY_URL = "https://github.com/FADEDTUMI/YHoAutoFish"
 APP_GITEE_REPOSITORY_URL = "https://gitee.com/fadedtumi/YHoAutoFish"

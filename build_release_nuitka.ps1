@@ -286,6 +286,8 @@ $NuitkArgs += @(
     "--noinclude-pytest-mode=nofollow",
     "--noinclude-setuptools-mode=nofollow",
     "--noinclude-unittest-mode=nofollow",
+    # === Deployment flags ===
+    "--no-deployment-flag=excluded-module-usage",
     # === Compiler settings ===
     "--low-memory",
     "--jobs=4"
@@ -315,7 +317,7 @@ if (-not $Onefile) {
     New-Item -ItemType Directory -Force -Path $NuitkDistDir | Out-Null
     Copy-Item -LiteralPath $OnefileExe -Destination (Join-Path $NuitkDistDir "$AppName.exe") -Force
     # Copy external data dirs that Nuitka placed alongside the exe
-    foreach ($extDir in @("assets", "ocr_models", "sponsor_qr", "certs")) {
+    foreach ($extDir in @("assets", "ocr_models", "sponsor_qr", "certs", "fish_encyclopedia")) {
         $src = Join-Path $ProjectRoot "build\nuitka\$extDir"
         if (Test-Path -LiteralPath $src) {
             Copy-Item -LiteralPath $src -Destination (Join-Path $NuitkDistDir $extDir) -Recurse -Force

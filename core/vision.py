@@ -545,6 +545,101 @@ class VisionCore:
         upper = np.array([h_high, 255, 255], dtype=np.uint8)
         return cv2.inRange(hsv, lower, upper)
 
+    def _build_debug_info_bar(self, roi_w, roi_h, cursor_x, target_x, confidence, source,
+                              track_score, band_h, fps=None, latency_ms=None,
+                              cursor_missing=False):
+        """构建底部深色信息栏，带颜色编码状态指示。"""
+        info_h = max(44, int(roi_w * 0.11))
+        bar = np.full((info_h, roi_w, 3), (22, 22, 28), dtype=np.uint8)
+        # 顶部分隔线
+        cv2.line(bar, (0, 0), (roi_w - 1, 0), (70, 70, 80), 1)
+
+        # 字号与行距：font scale 取 info_h/40 保证缩放后仍可读
+        fs = max(0.45, info_h / 40.0)
+        thick = 2
+        baseline1 = max(16, int(info_h * 0.40))
+        baseline2 = max(34, int(info_h * 0.84))
+        gap = max(8, int(roi_w * 0.016))
+        x = 6
+
+        # BGR 颜色定义
+        col_yellow = (0, 210, 245)
+        col_green = (30, 200, 70)
+        col_red = (50, 50, 240)
+        col_dim = (140, 140, 150)
+        col_cyan = (200, 190, 50)
+        col_orange = (0, 140, 240)
+
+        if cursor_missing:
+            cv2.putText(bar, "CURSOR MISSING", (x, baseline1),
+                        cv2.FONT_HERSHEY_DUPLEX, fs, col_red, thick, cv2.LINE_AA)
+            return bar
+
+        # 置信度颜色
+        if confidence >= 0.75:
+            col_conf = col_green
+        elif confidence >= 0.50:
+            col_conf = col_yellow
+        else:
+            col_conf = col_red
+
+        # track_score 颜色
+        if track_score >= 0.60:
+            col_track = col_green
+        elif track_score >= 0.35:
+            col_track = col_yellow
+        else:
+            col_track = col_red
+
+        # 检测来源颜色编码
+        source_colors = {
+            "color": col_yellow,
+            "template": col_cyan,
+            "reference-color": col_green,
+            "target-template": col_cyan,
+            "row-single-color": col_green,
+            "row-split-color": col_orange,
+            "split-color": col_orange,
+            "single-color": col_green,
+        }
+        col_src = source_colors.get(source, col_dim)
+
+        def _put(text, color, y=baseline1, advance=True):
+            nonlocal x
+            (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_DUPLEX, fs, thick)
+            cv2.putText(bar, text, (x, y), cv2.FONT_HERSHEY_DUPLEX, fs, color, thick, cv2.LINE_AA)
+            if advance:
+                x += tw + gap
+
+        # 第一行：位置 + track
+        _put(f"cur:{cursor_x}", col_yellow)
+        if target_x is not None:
+            _put(f"tgt:{target_x}", col_green)
+            _put(f"trk:{track_score:.2f}", col_track)
+        else:
+            _put("tgt:---", col_dim)
+
+        # 第二行：conf + source + band
+        x = 6
+        _put(f"c:{confidence:.2f}", col_conf, y=baseline2)
+        _put(source, col_src, y=baseline2)
+        if band_h is not None:
+            _put(f"b:{band_h}px", col_dim, y=baseline2)
+
+        # FPS/延迟 右对齐
+        if fps is not None or latency_ms is not None:
+            parts = []
+            if fps is not None:
+                parts.append(f"{fps:.0f}fps")
+            if latency_ms is not None:
+                parts.append(f"{latency_ms:.0f}ms")
+            perf_text = "  ".join(parts)
+            (tw, _), _ = cv2.getTextSize(perf_text, cv2.FONT_HERSHEY_DUPLEX, fs, thick)
+            cv2.putText(bar, perf_text, (max(6, roi_w - tw - 8), baseline2),
+                        cv2.FONT_HERSHEY_DUPLEX, fs, col_dim, thick, cv2.LINE_AA)
+
+        return bar
+
     def analyze_fishing_bar(
         self,
         roi_img,
@@ -558,6 +653,8 @@ class VisionCore:
         target_scale_steps=5,
         allow_target_template=False,
         draw_debug=True,
+        fps=None,
+        latency_ms=None,
     ):
         """
         解析上方耐力条区域。
@@ -640,9 +737,10 @@ class VisionCore:
                 cursor_candidates.append(template_cursor)
                 cursor = self._select_cursor_candidate(cursor_candidates, green_candidates, roi_w, roi_h)
         if cursor is None:
-            if debug_img is not None:
-                cv2.putText(debug_img, "cursor missing", (4, max(12, roi_h - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
-            return None, None, None, debug_img, 0.0
+            debug_meta = {"cursor_x": None, "target_x": None, "confidence": 0.0,
+                          "source": "", "track_score": 0.0, "band_h": None,
+                          "fps": fps, "latency_ms": round(latency_ms, 1) if latency_ms is not None else None}
+            return None, None, None, debug_img, 0.0, debug_meta
 
         band_half = max(6, int(cursor["h"] * 0.85), int(roi_h * 0.22))
         band_y1 = max(0, int(cursor["cy"]) - band_half)
@@ -743,6 +841,20 @@ class VisionCore:
         if target:
             confidence = min(0.98, cursor["confidence"] * 0.42 + target["confidence"] * 0.58)
 
+        # 构建调试元数据（由GUI层用原生文本控件渲染，不堆叠到图像上）
+        source = cursor.get("source", "color")
+        track_score = target.get("track_score", 0.0) if target else 0.0
+        debug_meta = {
+            "cursor_x": cursor_x,
+            "target_x": target_x,
+            "confidence": round(confidence, 3),
+            "source": source,
+            "track_score": round(track_score, 3),
+            "band_h": band_y2 - band_y1,
+            "fps": fps,
+            "latency_ms": round(latency_ms, 1) if latency_ms is not None else None,
+        }
+
         if debug_img is not None:
             cv2.rectangle(debug_img, (0, band_y1), (roi_w - 1, max(band_y1, band_y2 - 1)), (255, 120, 0), 1)
             cv2.rectangle(
@@ -762,14 +874,8 @@ class VisionCore:
                     1,
                 )
                 cv2.line(debug_img, (target_x, 0), (target_x, roi_h), (0, 255, 0), 2)
-            source = cursor.get("source", "color")
-            if target:
-                track_score = target.get("track_score", 0.0)
-                cv2.putText(debug_img, f"conf {confidence:.2f} {source} rail {track_score:.2f}", (4, max(12, roi_h - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-            else:
-                cv2.putText(debug_img, f"conf {confidence:.2f} {source}", (4, max(12, roi_h - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
 
-        return target_x, cursor_x, target_w, debug_img, confidence
+        return target_x, cursor_x, target_w, debug_img, confidence, debug_meta
 
     def _cursor_template_candidate(self, roi_img, cursor_template_paths, roi_w, roi_h, scale_range=None, scale_steps=5):
         if not cursor_template_paths:
@@ -1101,7 +1207,7 @@ class VisionCore:
         hue = patch[:, :, 0]
         sat = patch[:, :, 1]
         val = patch[:, :, 2]
-        cyan_green = (hue >= 48) & (hue <= 102) & (sat >= 135) & (val >= 96)
+        cyan_green = (hue >= 48) & (hue <= 102) & (sat >= 120) & (val >= 96)
         bright_core = (hue >= 56) & (hue <= 96) & (sat >= 155) & (val >= 108)
         cyan_ratio = float(np.count_nonzero(cyan_green)) / float(cyan_green.size)
         core_ratio = float(np.count_nonzero(bright_core)) / float(bright_core.size)
@@ -1334,7 +1440,7 @@ class VisionCore:
             sat = hsv[:, :, 1]
             val = hsv[:, :, 2]
             target_like = (
-                ((hue >= 48) & (hue <= 102) & (sat >= 135) & (val >= 96))
+                ((hue >= 48) & (hue <= 102) & (sat >= 120) & (val >= 96))
                 | ((hue >= 56) & (hue <= 96) & (sat >= 155) & (val >= 108))
             )
             strict_mask = np.zeros_like(mask)

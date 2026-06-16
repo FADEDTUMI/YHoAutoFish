@@ -12,40 +12,40 @@ class PIDController:
     def reset(self):
         self.integral = 0
         self.last_error = 0
+        self.last_input = 0
+        self._filtered_derivative = 0
         self.last_time = time.time()
 
-    def update(self, error):
+    def update(self, error, measurement=None):
         now = time.time()
         dt = now - self.last_time
-        
-        # 第一次调用或时间极短，不计算 I 和 D
-        if dt <= 0.001: 
+
+        if dt <= 0.001:
             return self.kp * error
-            
-        # 1. 比例项 (P)
+
         p_out = self.kp * error
-        
-        # 2. 积分项 (I) - 增加抗饱和 (Anti-windup) 处理
+
         self.integral += error * dt
-        # 限制积分范围，防止长时间偏离导致积分值爆炸（这里将积分限制在比较小的范围）
-        self.integral = max(min(self.integral, 20), -20) 
+        self.integral = max(min(self.integral, 20), -20)
         i_out = self.ki * self.integral
-        
-        # 3. 微分项 (D) - 关键：计算游标靠近速度，提前减速
-        derivative = (error - self.last_error) / dt
-        d_out = self.kd * derivative
-        
-        output = p_out + i_out + d_out
-        
-        # 更新状态
+
+        # Derivative on Measurement + EMA 低通滤波
+        inp = measurement if measurement is not None else error
+        raw_derivative = -(inp - self.last_input) / dt
+        alpha = 0.2
+        self._filtered_derivative += alpha * (raw_derivative - self._filtered_derivative)
+        d_out = self.kd * self._filtered_derivative
+
         self.last_error = error
+        self.last_input = inp
         self.last_time = now
-        
-        # 限制输出范围
+
+        output = p_out + i_out + d_out
+
         min_limit, max_limit = self.output_limits
         if min_limit is not None:
             output = max(output, min_limit)
         if max_limit is not None:
             output = min(output, max_limit)
-            
+
         return output

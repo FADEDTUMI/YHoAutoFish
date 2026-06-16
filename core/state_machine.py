@@ -336,8 +336,22 @@ class StateMachine:
         self.current_state = self.STATE_RECOVERING
         self._log(f"[恢复] {reason}，开始等待可抛钩界面恢复。")
 
+    def _push_debug_status_frame(self, text):
+        """向调试队列推送一帧状态标记画面，避免调试视图冻结无反馈。"""
+        if not self.config.get("debug_mode", False) or self.debug_queue is None:
+            return
+        try:
+            import cv2 as _cv2
+            frame = _cv2.zeros((60, 300, 3), dtype="uint8")
+            _cv2.putText(frame, text, (10, 40), _cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+            if self.debug_queue.qsize() < 2:
+                self.debug_queue.put(frame)
+        except Exception:
+            pass
+
     def _enter_result_from_fishing_anomaly(self, reason):
         self._log(f"[溜鱼] {reason}，进入结果判定...")
+        self._push_debug_status_frame(reason[:30])
         self.ctrl.release_all()
         self.round.fish_control_direction = 0
         self.round.fish_control_min_hold_until = 0
@@ -511,8 +525,8 @@ class StateMachine:
 
         # 恢复合理的高度范围，根据用户提供的精确比例进行定位：
         # 横向占比是30%到70% (X: 0.3, Width: 0.4)
-        # 竖向占比是从5.56%到8.33% (Y: 0.0556, Height: 0.0277)
-        ROI_FISHING_BAR = (0.3, 0.0556, 0.4, 0.0277) 
+        # 竖向占比是从6.21%到7.68% (Y: 0.0621, Height: 0.0147)
+        ROI_FISHING_BAR = (0.3, 0.0621, 0.4, 0.0147)
         
         ROI_CENTER_TEXT = (0.2, 0.2, 0.6, 0.5)
         
@@ -732,6 +746,7 @@ class StateMachine:
         elapsed = time.time() - self.round.fishing_start_time
         if elapsed > self.fishing_timeout:
             self._log("[防卡死] 溜鱼超时，强制结束当前回合。")
+            self._push_debug_status_frame("fishing timeout -> RESULT")
             self.round.fishing_start_time = 0
             self.current_state = self.STATE_RESULT
             return
@@ -740,7 +755,10 @@ class StateMachine:
         if elapsed >= 1.0 and not getattr(self.round, 'confirmed_fishing_bar', False) and not recent_bar_seen and self.result_det.check_terminal_result_before_bar(rect, elapsed):
             return
 
-        target_x, cursor_x, target_w, debug_img, bar_confidence = self.bar_detector.select_fishing_bar_detection(rect, roi)
+        det_result = self.bar_detector.select_fishing_bar_detection(rect, roi)
+        target_x, cursor_x, target_w, debug_img, bar_confidence = det_result[:5]
+        is_stale = det_result[5] if len(det_result) > 5 else False
+        debug_meta = det_result[6] if len(det_result) > 6 else None
         # detection_confidence removed — fired at ~100Hz, flooding the analytics queue
         # with 5000+ events per round and burying important events like fishing_success.
         # Bar confidence is already captured by PerfSampler via perf_snapshot.
@@ -748,10 +766,11 @@ class StateMachine:
         # 性能优化：限制 Debug 图像的发送频率（一秒最多 10 帧），防止撑爆队列导致主线程阻塞
         if self.config.get("debug_mode", False) and debug_img is not None:
             now = time.time()
-            if getattr(self, '_last_debug_time', 0) == 0 or (now - self._last_debug_time) >= 0.25:
+            if getattr(self, '_last_debug_time', 0) == 0 or (now - self._last_debug_time) >= 0.10:
                 if self.debug_queue is not None and self.debug_queue.qsize() < 2:
                     self.debug_queue.put(debug_img)
                 self._last_debug_time = now
+                self._last_debug_meta = debug_meta
 
         # 判断是否结束 (无论是成功还是鱼儿溜走，耐力条都会消失)
         if target_x is None or cursor_x is None:
@@ -816,7 +835,12 @@ class StateMachine:
                 self.round.result_full_check_last = self.round.missing_start_time
 
             missing_elapsed = time.time() - self.round.missing_start_time
-            if missing_elapsed >= 0.12 and self.result_det.check_result_signals_after_bar_missing(rect, missing_elapsed):
+            # 最小溜鱼时间守卫：溜鱼开始后 3 秒内不退出 FISHING 状态
+            # 防止特效/粒子短暂遮挡耐力条导致误判"鱼溜走了"
+            fishing_elapsed = time.time() - getattr(self.round, 'fishing_start_time', 0)
+            if fishing_elapsed < 3.0:
+                return
+            if missing_elapsed >= 0.50 and self.result_det.check_result_signals_after_bar_missing(rect, missing_elapsed):
                 return
             if self.bar_detector.should_enter_result_after_confirmed_bar_missing(missing_elapsed):
                 self.bar_detector.enter_result_after_bar_missing()
@@ -836,16 +860,20 @@ class StateMachine:
 
         now = time.time()
         last_seen_time = getattr(self.round, 'last_bar_seen_time', 0)
-        if last_seen_time and now - last_seen_time <= 0.55:
-            self.round.bar_seen_streak = int(getattr(self.round, 'bar_seen_streak', 0)) + 1
-        else:
-            self.round.bar_seen_streak = 1
-            self.round.bar_first_seen_time = now
-        self.round.last_bar_seen_time = now
+        if not is_stale:
+            if last_seen_time and now - last_seen_time <= 0.55:
+                self.round.bar_seen_streak = int(getattr(self.round, 'bar_seen_streak', 0)) + 1
+            else:
+                self.round.bar_seen_streak = 1
+                self.round.bar_first_seen_time = now
+            self.round.last_bar_seen_time = now
         self.round.seen_fishing_bar = True
         if not getattr(self.round, 'confirmed_fishing_bar', False) and self.round.bar_seen_streak >= 2:
             self.round.confirmed_fishing_bar = True
             self.round.fishing_bar_confirmed_time = now
+            if not getattr(self.round, "fishing_control_started", False):
+                self.round.fishing_control_started = True
+                self.round.fishing_control_started_time = now
 
         # === 核心追踪算法：直接误差 + 滞回保持 ===
         # A/D 是离散按键，不是连续舵量；真实游戏里视觉速度噪声较大，
@@ -878,7 +906,7 @@ class StateMachine:
         
         # PID 控制器计算基础偏差修正力
         tracking_strength = self._normalize_tracking_strength()
-        control_signal = self.pid.update(error) * tracking_strength
+        control_signal = self.pid.update(error, measurement=target_x) * tracking_strength
         if not hasattr(self, '_pid_sample_counter'):
             self._pid_sample_counter = 0
         self._pid_sample_counter += 1

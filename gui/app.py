@@ -1603,6 +1603,8 @@ class AuthorizationDialog(QDialog):
         self.group_worker = None
         self.current_user_code = ""
         self._bound_mode = False
+        self._poll_retry_count = 0
+        self._poll_retry_max = 3
         self.poll_timer = QTimer(self)
         self.poll_timer.setInterval(2500)
         self.poll_timer.timeout.connect(self.poll_activation)
@@ -1857,8 +1859,9 @@ class AuthorizationDialog(QDialog):
             self.instruction_label.setText("授权缓存已超过离线宽限或服务器暂时不可达，请联网后点击“立即复验”。")
             self.status_label.setText(self.app_window._auth_recovery_display_message(recovery, state))
             self.copy_button.setEnabled(bool(code))
-            self.generate_button.setVisible(False)
-            self.generate_button.setEnabled(False)
+            self.generate_button.setVisible(True)
+            self.generate_button.setEnabled(True)
+            self.generate_button.setText("生成新绑定码")
             self.recheck_button.setVisible(True)
             self.recheck_button.setText("立即复验")
             self.recheck_button.setToolTip("使用本机已有授权令牌立即请求服务器复验。")
@@ -2074,6 +2077,7 @@ class AuthorizationDialog(QDialog):
         QTimer.singleShot(1400, lambda: self._set_busy(False))
 
     def start_activation(self):
+        self._poll_retry_count = 0
         recovery = classify_auth_recovery(self.app_window.auth_state)
         if self.app_window.auth_state.access_token and recovery.mode in ("recheck_only", "transient_error"):
             self._set_busy(True)
@@ -2196,12 +2200,20 @@ class AuthorizationDialog(QDialog):
             state.apply_check_timing(server_time)
             self.app_window._apply_auth_state(state, persist=True)
             self.app_window.auth_verified_this_session = True
+            self._poll_retry_count = 0
             self.status_label.setText("授权成功，功能已解锁。")
             self._refresh_binding_status_card()
             self.poll_timer.stop()
             QTimer.singleShot(450, self.accept)
             return
         if status == "token_already_issued":
+            if self._poll_retry_count < self._poll_retry_max:
+                self.poll_timer.stop()
+                self._poll_retry_count += 1
+                self.status_label.setText(f"正在确认绑定结果（{self._poll_retry_count}/{self._poll_retry_max}）...")
+                QTimer.singleShot(2000, self.poll_activation)
+                return
+            self._poll_retry_count = 0
             self.poll_timer.stop()
             message = str(data.get("message") or "这个绑定码已经完成过授权。若当前设备仍未解锁，请重新生成绑定码并在群内绑定。")
             state = AuthState.from_dict(self.app_window.auth_state.to_dict())
@@ -2374,7 +2386,7 @@ class AboutDialog(QDialog):
 
         rows = (
             ("作者", APP_AUTHOR),
-            ("开源地址", APP_REPOSITORY_URL),
+            ("项目地址", APP_REPOSITORY_URL),
             ("使用范围", "个人学习、研究与本地非商业使用"),
             ("实现方式", "不读取或修改游戏内存，不注入 DLL，不修改游戏资源文件"),
             ("风险提示", "自动化行为仍可能违反平台规则，账号与使用风险由使用者自行承担"),
@@ -2775,7 +2787,7 @@ class UpdatePolicyConfirmDialog(QDialog):
                 2. 自动化行为可能违反平台规则并带来账号、设备、收益或其他风险，后果由实际使用者自行承担。
               </p>
               <p style="margin:0 0 8px 0; color:#9AB0CA; font-size:13px;">
-                3. 本程序开源免费发布，任何付费出售、卡密售卖、二次打包收费或冒充官方工具的行为均非作者授权。
+                3. 本程序以源码可见（Source-Available）方式免费发布，禁止二次分发、再分发及商业使用，任何付费出售、卡密售卖、二次打包收费或冒充官方工具的行为均非作者授权。
               </p>
             </div>
             """
@@ -3446,7 +3458,7 @@ class FloatingControlWindow(QFrame):
         self.debug_panel = QFrame()
         self.debug_panel.setProperty("variant", "soft")
         self.debug_panel.setStyleSheet(panel_stylesheet())
-        self.debug_panel.setMinimumHeight(198)
+        self.debug_panel.setMinimumHeight(232)
         debug_layout = QVBoxLayout(self.debug_panel)
         debug_layout.setContentsMargins(12, 12, 12, 12)
         debug_layout.setSpacing(10)
@@ -3459,7 +3471,7 @@ class FloatingControlWindow(QFrame):
 
         self.debug_preview = QLabel("等待画面...")
         self.debug_preview.setAlignment(Qt.AlignCenter)
-        self.debug_preview.setFixedSize(236, 118)
+        self.debug_preview.setFixedSize(236, 150)
         self.debug_preview.setStyleSheet(
             """
             background-color: rgba(5, 12, 20, 0.78);
@@ -3471,6 +3483,16 @@ class FloatingControlWindow(QFrame):
             """
         )
         debug_layout.addWidget(self.debug_preview)
+
+        self.debug_info_label = QLabel("")
+        self.debug_info_label.setStyleSheet(
+            f"background: transparent; border: none; color: {APP_COLORS.get('text_dim', '#9AB0CA')}; "
+            "font-size: 11px; font-weight: 600; font-family: 'Consolas', 'Cascadia Code', monospace; padding: 0 2px;"
+        )
+        self.debug_info_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.debug_info_label.setWordWrap(True)
+        debug_layout.addWidget(self.debug_info_label)
+
         control_layout.addWidget(self.debug_panel)
         self.body_stack.addWidget(self.control_page)
 
@@ -3596,7 +3618,7 @@ class FloatingControlWindow(QFrame):
             width, height = 340, 410
         else:
             width = 304
-            height = 452 if debug_enabled else 226
+            height = 494 if debug_enabled else 226
 
         self.setFixedSize(width, height)
         self.adjustSize()
@@ -3888,6 +3910,30 @@ class FloatingControlWindow(QFrame):
             Qt.FastTransformation,
         )
         self.debug_preview.setPixmap(pixmap)
+        # 更新调试元数据文本
+        meta = getattr(self.app_window.sm, '_last_debug_meta', None)
+        if meta and hasattr(self, 'debug_info_label'):
+            parts = []
+            cx = meta.get('cursor_x')
+            tx = meta.get('target_x')
+            c = meta.get('confidence', 0)
+            src = meta.get('source', '')
+            trk = meta.get('track_score', 0)
+            fps = meta.get('fps')
+            lat = meta.get('latency_ms')
+            parts.append(f"cur:{cx}" if cx is not None else "cur:---")
+            parts.append(f"tgt:{tx}" if tx is not None else "tgt:---")
+            parts.append(f"c:{c:.2f}")
+            if src:
+                parts.append(src)
+            parts.append(f"trk:{trk:.2f}")
+            if fps is not None:
+                parts.append(f"{fps:.0f}fps")
+            if lat is not None:
+                parts.append(f"{lat:.0f}ms")
+            self.debug_info_label.setText("  ".join(parts))
+        elif hasattr(self, 'debug_info_label'):
+            self.debug_info_label.setText("")
 
     def hideEvent(self, event):
         super().hideEvent(event)
@@ -4098,7 +4144,7 @@ class OpenSourceWarningDialog(QDialog):
         )
         layout.addWidget(title)
 
-        warning_chip = QLabel("本程序开源免费发布")
+        warning_chip = QLabel("源码可见 · 禁止二次分发与商用")
         warning_chip.setStyleSheet(
             """
             QLabel {
@@ -4122,7 +4168,7 @@ class OpenSourceWarningDialog(QDialog):
             """
             <div style="font-family:'Microsoft YaHei UI'; line-height:1.7;">
               <p style="margin:0 0 12px 0; color:#FFFFFF; font-size:15px; font-weight:800;">
-                本程序为开源项目，永久免费发布。
+                本程序以源码可见（Source-Available）方式发布，永久免费使用，禁止二次分发、再分发及任何形式的商业使用。
               </p>
               <p style="margin:0 0 12px 0; color:#FFB4BC; font-size:14px; font-weight:700;">
                 任何通过付费渠道、卡密渠道、代下渠道、网盘贩卖、二手转卖、打包收费等方式向你提供本程序的行为，均属于非法传播或恶意牟利。
@@ -4131,7 +4177,7 @@ class OpenSourceWarningDialog(QDialog):
                 如果你是付费获得本程序，请立即停止继续向对方付款，并尽快申请退款、投诉或维权。你的权益已经受到侵害，出售者并不具备合法收费授权。
               </p>
               <p style="margin:0 0 10px 0; color:#9AB0CA; font-size:13px;">
-                请仅从下方开源地址获取最新版本，避免下载被二次打包、植入风险代码或篡改内容的文件：
+                请仅从下方项目地址获取最新版本，避免下载被二次打包、植入风险代码或篡改内容的文件：
               </p>
               <p style="margin:6px 0 0 0; color:#67EAEC; font-size:13px; font-weight:800;">
                 https://github.com/FADEDTUMI/YHoAutoFish
@@ -4144,7 +4190,7 @@ class OpenSourceWarningDialog(QDialog):
         footer = QHBoxLayout()
         footer.setSpacing(12)
 
-        link_button = QPushButton("打开开源地址")
+        link_button = QPushButton("打开项目地址")
         link_button.setFocusPolicy(Qt.NoFocus)
         link_button.setStyleSheet(secondary_button_stylesheet())
         link_button.clicked.connect(
@@ -4848,9 +4894,15 @@ class AppWindow(QMainWindow):
             self.auth_verified_this_session = True
             # Initialize EventTracker after successful auth
             try:
+                _sync_id = 0
+                try:
+                    _sync_id = self.sm.record_mgr.records.get("last_synced_record_id", 0)
+                except Exception:
+                    pass
                 EventTracker.get().init(
                     license_id=str(getattr(state, "license_id", "") or ""),
                     app_version=APP_VERSION,
+                    last_synced_record_id=_sync_id,
                 )
                 # Attach WS send function if already connected
                 ws_worker = getattr(self, "auth_ws_worker", None)
@@ -4894,6 +4946,10 @@ class AppWindow(QMainWindow):
                 state.jwt_expires_at = float(jwt_payload.get("exp", 0)) if jwt_payload else float(result.get("jwt_expires_at", 0))
                 state.jwt_issued_monotonic = time.monotonic()
                 state.protocol_version = 2
+                # Save refresh_token if server returned it (V1→V2 migration with tokens record)
+                if result.get("refresh_token"):
+                    state.refresh_token = str(result["refresh_token"])
+                    state.refresh_expires_at = float(result.get("refresh_expires_at", 0))
                 from core.auth_store import save_auth_state
                 save_auth_state(state)
                 self.write_log("[来源验证] V1→V2 迁移成功，已获取 JWT。")
@@ -5087,6 +5143,28 @@ class AppWindow(QMainWindow):
             Qt.FastTransformation,
         )
         self.debug_preview.setPixmap(pixmap)
+        # 更新调试元数据文本
+        meta = getattr(self.sm, '_last_debug_meta', None)
+        if meta and hasattr(self, 'debug_info_label'):
+            parts = []
+            cx = meta.get('cursor_x')
+            tx = meta.get('target_x')
+            c = meta.get('confidence', 0)
+            src = meta.get('source', '')
+            trk = meta.get('track_score', 0)
+            fps = meta.get('fps')
+            lat = meta.get('latency_ms')
+            parts.append(f"cur:{cx}" if cx is not None else "cur:---")
+            parts.append(f"tgt:{tx}" if tx is not None else "tgt:---")
+            parts.append(f"c:{c:.2f}")
+            if src:
+                parts.append(src)
+            parts.append(f"trk:{trk:.2f}")
+            if fps is not None:
+                parts.append(f"{fps:.0f}fps")
+            if lat is not None:
+                parts.append(f"{lat:.0f}ms")
+            self.debug_info_label.setText("  ".join(parts))
         if self.floating_window is not None and self.floating_window.isVisible():
             self.floating_window.set_debug_frame(frame)
 
@@ -5606,11 +5684,11 @@ class AppWindow(QMainWindow):
     def show_anti_infringement_policy(self):
         html = """
         <div style="font-family:'Microsoft YaHei UI'; line-height:1.72;">
-          <p style="color:#FFB4BC; font-size:15px; font-weight:900;">本程序开源免费发布，任何付费出售、卡密售卖、网盘倒卖、二次打包收费均不是作者授权行为。</p>
+          <p style="color:#FFB4BC; font-size:15px; font-weight:900;">本程序以源码可见（Source-Available）方式免费发布，禁止二次分发、再分发及商业使用。任何付费出售、卡密售卖、网盘倒卖、二次打包收费均不是作者授权行为。</p>
           <p style="color:#9AB0CA; font-size:13px;">如果你从付费渠道获得本程序，说明你的权益可能已经受到侵犯。请停止继续付款，尽快申请退款、投诉或维权。</p>
           <p style="color:#F3F8FF; font-size:14px; font-weight:800;">唯一建议来源</p>
           <p style="color:#67EAEC; font-size:13px; font-weight:800;">https://github.com/FADEDTUMI/YHoAutoFish</p>
-          <p style="color:#9AB0CA; font-size:13px;">从非开源渠道下载的文件可能被植入风险代码、篡改配置或夹带无关内容。请优先从开源仓库获取并核对项目说明。</p>
+          <p style="color:#9AB0CA; font-size:13px;">从非官方渠道下载的文件可能被植入风险代码、篡改配置或夹带无关内容。请优先从项目仓库获取并核对项目说明。</p>
         </div>
         """
         dialog = PolicyDialog("反侵权协议", "提醒用户识别非法付费传播，保护自己的下载与使用权益。", html, self)
@@ -5746,7 +5824,7 @@ class AppWindow(QMainWindow):
         author.setStyleSheet(f"background: transparent; border: none; color: {APP_COLORS['text_dim']}; font-size: 12px; font-weight: 700;")
         author_text_col.addWidget(author)
 
-        author_note = QLabel("开源免费 · 学习研究用途")
+        author_note = QLabel("源码可见 · 禁止二次分发与商用")
         author_note.setStyleSheet(f"background: transparent; border: none; color: {APP_COLORS['text_soft']}; font-size: 11px;")
         author_text_col.addWidget(author_note)
 
@@ -5877,7 +5955,7 @@ class AppWindow(QMainWindow):
 
         self.debug_preview = QLabel()
         self.debug_preview.setAlignment(Qt.AlignCenter)
-        self.debug_preview.setMinimumSize(300, 118)
+        self.debug_preview.setMinimumSize(300, 150)
         self.debug_preview.setStyleSheet(
             """
             background-color: rgba(8, 15, 24, 0.78);
@@ -5886,6 +5964,15 @@ class AppWindow(QMainWindow):
             """
         )
         debug_layout.addWidget(self.debug_preview)
+
+        self.debug_info_label = QLabel("")
+        self.debug_info_label.setStyleSheet(
+            f"background: transparent; border: none; color: {APP_COLORS.get('text_dim', '#9AB0CA')}; "
+            "font-size: 12px; font-weight: 600; font-family: 'Consolas', 'Cascadia Code', monospace;"
+        )
+        self.debug_info_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.debug_info_label.setWordWrap(True)
+        debug_layout.addWidget(self.debug_info_label)
 
         self.debug_help_label = QLabel()
         self.debug_help_label.setWordWrap(True)

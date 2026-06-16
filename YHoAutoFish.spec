@@ -51,7 +51,7 @@ def safe_collect_submodules(package):
 
 datas = []
 datas += existing_data("assets", "assets")
-datas += existing_data("异环鱼类图鉴资源", "异环鱼类图鉴资源")
+datas += existing_data("fish_encyclopedia", "fish_encyclopedia")
 datas += existing_data("ocr_models", "ocr_models")
 datas += existing_data("sponsor_qr", "sponsor_qr")
 datas += existing_data("certs", "certs")
@@ -94,6 +94,11 @@ for package in ("cnocr", "cnstd", "rapidocr", "onnxruntime"):
     datas += safe_copy_metadata(package)
     binaries += safe_collect_dynamic_libs(package)
     hiddenimports += safe_collect_submodules(package)
+
+# certifi CA 证书（frozen 模式下 SSL 需要）
+datas += safe_collect_data_files("certifi")
+datas += safe_copy_metadata("certifi")
+hiddenimports += ["certifi"]
 
 
 a = Analysis(

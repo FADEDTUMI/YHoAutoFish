@@ -1,6 +1,10 @@
-YHo AutoFish Restricted License
+YHo AutoFish Source-Available Restricted License
 
 Copyright (c) 2026 FADEDTUMI. All rights reserved.
+
+This project is published under a Source-Available license: the source code
+is publicly visible for transparency and review, but this is NOT an
+Open-Source license. All rights not explicitly granted below are reserved.
 
 This project, including its source code, executable builds, images,
 documentation, configuration files, and bundled assets, is made available
@@ -30,7 +34,9 @@ Without prior written permission from the copyright holder, you may not:
 - Modify, adapt, translate, refactor, fork, rebrand, decompile, reverse engineer,
   or create derivative works based on this project.
 - Redistribute, mirror, upload, republish, bundle, repackage, or share modified
-  or unmodified copies of this project.
+  or unmodified copies of this project. This includes but is not limited to
+  secondary distribution, re-distribution, re-uploading to any platform, or
+  making this project available through any third-party channel.
 - Remove, hide, alter, or misrepresent copyright notices, author attribution,
   license notices, interface attribution, or project identity.
 - Use this project to violate game terms, platform rules, laws, regulations,

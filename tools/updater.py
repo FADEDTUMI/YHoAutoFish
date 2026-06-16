@@ -779,11 +779,31 @@ def perform_update(args, reporter):
         copied, skipped = apply_payload(payload_root, app_dir, runner_path=runner_path, progress_callback=on_copy)
         log(app_dir, f"文件覆盖完成，复制 {copied} 个文件，跳过用户数据 {skipped} 个文件")
 
-        # Clean up PyInstaller leftovers after migrating to Nuitka
+        # 仅当更新包不含 _internal（Nuitka 版）时，才清理旧版 PyInstaller 的 _internal 目录。
+        # 如果更新包本身包含 _internal（PyInstaller 版），说明是 PyInstaller → PyInstaller 更新，不能清理。
+        new_package_has_internal = (payload_root / "_internal").is_dir()
         legacy_internal = app_dir / "_internal"
-        if legacy_internal.is_dir():
+        if legacy_internal.is_dir() and not new_package_has_internal:
+            # Nuitka 更新包：迁移旧版图鉴资源到根目录，然后清理 _internal
+            for enc_name in ("fish_encyclopedia", "异环鱼类图鉴资源"):
+                src_enc = legacy_internal / enc_name
+                if src_enc.is_dir():
+                    dst_enc = app_dir / enc_name
+                    if not dst_enc.is_dir():
+                        shutil.copytree(src_enc, dst_enc)
+                        log(app_dir, f"已迁移图鉴资源 {enc_name} 到程序根目录")
+                    break
             shutil.rmtree(legacy_internal, ignore_errors=True)
-            log(app_dir, "已清理旧版 PyInstaller _internal 目录")
+            log(app_dir, "已清理旧版 PyInstaller _internal 目录（Nuitka 更新）")
+        elif new_package_has_internal and not legacy_internal.exists():
+            # Nuitka → PyInstaller 升级：清理旧版 Nuitka 遗留在根目录的目录
+            # 这些目录已被 PyInstaller 打入 _internal/，根目录的副本是多余的
+            NUITKA_ARTIFACTS = ("fish_encyclopedia", "异环鱼类图鉴资源", "cnstd", "cnocr", "assets", "ocr_models", "certs")
+            for name in NUITKA_ARTIFACTS:
+                artifact = app_dir / name
+                if artifact.is_dir():
+                    shutil.rmtree(artifact, ignore_errors=True)
+                    log(app_dir, f"已清理旧版 Nuitka 遗留目录: {name}")
 
         reporter.phase("正在清理临时文件", 96, "正在清理下载包和临时解压目录。")
         remove_if_update_download(package, app_dir)

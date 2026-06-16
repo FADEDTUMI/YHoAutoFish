@@ -21,6 +21,13 @@ from urllib.request import Request, urlopen
 
 log = logging.getLogger(__name__)
 
+
+def _tracker_ssl_ctx():
+    """创建 SSL context，frozen 模式下 main.py monkey-patch 自动叠加 certifi CA。"""
+    import ssl
+    return ssl.create_default_context()
+
+
 # ---------------------------------------------------------------------------
 # Event Buffer — SQLite-backed persistent queue (survives crashes)
 # ---------------------------------------------------------------------------
@@ -137,7 +144,7 @@ class UmamiBridge:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            urlopen(req, timeout=5)
+            urlopen(req, timeout=5, context=_tracker_ssl_ctx())
         except Exception as exc:
             log.debug("Umami send failed: %s", exc)
 
@@ -354,6 +361,8 @@ class EventTracker:
         self._fish_failed: int = 0
         self._initialized: bool = False
         self._last_sync_ts: float = 0
+        self._last_synced_record_id: int = 0
+        self._sync_lock = threading.Lock()
 
     @classmethod
     def get(cls) -> "EventTracker":
@@ -364,10 +373,12 @@ class EventTracker:
         return cls._instance
 
     def init(self, license_id: str, ws_send_fn=None, app_version: str = "",
-             umami_base_url: str = "", umami_website_id: str = ""):
+             umami_base_url: str = "", umami_website_id: str = "",
+             last_synced_record_id: int = 0):
         self._license_id = license_id
         self._app_version = app_version
         self._session_id = str(uuid.uuid4())
+        self._last_synced_record_id = last_synced_record_id
 
         if umami_base_url and umami_website_id:
             self._umami = UmamiBridge(umami_base_url, umami_website_id)
@@ -522,11 +533,28 @@ class EventTracker:
     # -- record sync --
 
     def sync_records(self, records_data: dict):
+        if not records_data or not isinstance(records_data, dict):
+            return
         now = time.time()
         if now - self._last_sync_ts < 60:
             return
-        self._last_sync_ts = now
-        self._emit("record_sync", "records_sync", records_data)
+        with self._sync_lock:
+            last_id = self._last_synced_record_id
+            full_history = records_data.get("history", [])
+            new_history = [r for r in full_history if r.get("record_id", 0) > last_id]
+            if not new_history and last_id > 0:
+                return  # don't refresh throttle, retry next call
+            # Truncate: send OLDEST unsent first (front of list), never skip records
+            sent_history = new_history[:500]
+            sent_max_id = max((r.get("record_id", 0) for r in sent_history), default=0)
+            self._last_sync_ts = now  # only refresh when actually sending
+            if sent_max_id > last_id:
+                self._last_synced_record_id = sent_max_id
+            self._emit("record_sync", "records_sync", {
+                "stats": records_data.get("stats", {}),
+                "encyclopedia": records_data.get("encyclopedia", {}),
+                "history": sent_history,
+            })
 
     # -- error reporting --
 

@@ -65,6 +65,7 @@ class RecordManager:
             "history": [],
             "summary": dict(self.DEFAULT_SUMMARY),
             "next_record_id": 1,
+            "last_synced_record_id": 0,
         }
         self._load_failed = False
         self._migration_needed = False
@@ -118,6 +119,7 @@ class RecordManager:
             summary.pop("last_record_id", None)
         self.records["summary"] = summary
         self.records["next_record_id"] = data.get("next_record_id", 1)
+        self.records["last_synced_record_id"] = data.get("last_synced_record_id", 0)
         self._migrate_record_ids()
         self._touch_cache()
 
@@ -215,11 +217,14 @@ class RecordManager:
                     raise
             try:
                 from core.tracker import EventTracker
-                EventTracker.get().sync_records({
+                tracker = EventTracker.get()
+                tracker.sync_records({
                     "stats": dict(self.records.get("stats", {})),
                     "encyclopedia": dict(self.records.get("encyclopedia", {})),
                     "history": list(self.records.get("history", [])),
                 })
+                # Persist last_synced_record_id so restart doesn't re-send full history
+                self.records["last_synced_record_id"] = getattr(tracker, '_last_synced_record_id', 0)
             except Exception:
                 pass
         except Exception as exc:

@@ -13,7 +13,21 @@
       "text": "HELLO",
       "read": true,
       "type": "notification"
+    },
+    {
+      "id": 3,
+      "time": "2026-06-07 18:55:40",
+      "text": "123123",
+      "read": true,
+      "type": "notification"
+    },
+    {
+      "id": 4,
+      "time": "2026-06-07 18:55:57",
+      "text": "HELLO 即将触发强制升级",
+      "read": true,
+      "type": "notification"
     }
   ],
-  "next_id": 3
+  "next_id": 5
 }

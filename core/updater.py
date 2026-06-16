@@ -124,6 +124,11 @@ def parse_version(version_text):
 def is_newer_version(remote_version, current_version=APP_VERSION):
     return parse_version(remote_version) > parse_version(current_version)
 
+def _ssl_context_with_certifi():
+    """创建 SSL context，frozen 模式下 main.py 的 monkey-patch 会自动叠加 certifi CA。"""
+    import ssl as _ssl
+    return _ssl.create_default_context()
+
 
 def _request(url, timeout=8, api=False):
     headers = {
@@ -141,7 +146,7 @@ def _request(url, timeout=8, api=False):
         url,
         headers=headers,
     )
-    return urllib.request.urlopen(request, timeout=timeout)
+    return urllib.request.urlopen(request, timeout=timeout, context=_ssl_context_with_certifi())
 
 
 def _load_json(url, timeout=8, label="GitHub Release 信息", api=False):
@@ -1271,7 +1276,7 @@ def _part_download_candidates(update_info, part, source):
 def _download_once(url, target_path, progress_callback=None, timeout=20, cancel_callback=None):
     _raise_if_cancelled(cancel_callback)
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context_with_certifi()) as response:
         total = int(response.headers.get("Content-Length") or 0)
         downloaded = 0
         target_path.parent.mkdir(parents=True, exist_ok=True)

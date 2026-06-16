@@ -8,6 +8,8 @@ class FishingBarDetector:
 
     def __init__(self, sm):
         self._sm = sm
+        self._debug_fps = None
+        self._debug_latency_ms = None
 
     # ------------------------------------------------------------------
     # 耐力条检测结果过滤
@@ -21,16 +23,16 @@ class FishingBarDetector:
                 fallback_cursor = self._sm.round.last_valid_cursor_x if cursor_x is None else cursor_x
                 fallback_width = self._sm.round.last_valid_target_w if target_w is None else target_w
                 if fallback_target is not None and fallback_cursor is not None and fallback_width is not None:
-                    return fallback_target, fallback_cursor, fallback_width, max(float(confidence or 0.0), 0.30)
-            return None, cursor_x, target_w, confidence
+                    return fallback_target, fallback_cursor, fallback_width, max(float(confidence or 0.0), 0.30), True
+            return None, cursor_x, target_w, confidence, False
 
         min_confidence = self._sm._normalize_ratio_config("bar_confidence_threshold", 0.45, 0.25, 0.85)
         if confidence < min_confidence:
             previous_time = getattr(self._sm.round, "last_valid_bar_time", 0)
             if previous_time and now - previous_time <= 0.70:
                 fallback_cursor = self._sm.round.last_valid_cursor_x if cursor_x is None else cursor_x
-                return self._sm.round.last_valid_target_x, fallback_cursor, self._sm.round.last_valid_target_w, confidence
-            return None, cursor_x, target_w, confidence
+                return self._sm.round.last_valid_target_x, fallback_cursor, self._sm.round.last_valid_target_w, confidence, True
+            return None, cursor_x, target_w, confidence, False
 
         previous_cursor_x = getattr(self._sm.round, "last_valid_cursor_x", None)
         previous_cursor_time = getattr(self._sm.round, "last_valid_cursor_time", 0)
@@ -43,7 +45,7 @@ class FishingBarDetector:
                     cursor_x = previous_cursor_x
                     confidence = max(0.0, confidence * 0.75)
                 else:
-                    return None, cursor_x, target_w, confidence
+                    return None, cursor_x, target_w, confidence, False
 
         previous_x = getattr(self._sm.round, "last_valid_target_x", None)
         previous_w = getattr(self._sm.round, "last_valid_target_w", None) or target_w
@@ -53,15 +55,15 @@ class FishingBarDetector:
             if target_w > width_jump_limit:
                 self._sm.round.bar_jump_reject_count = int(getattr(self._sm.round, "bar_jump_reject_count", 0)) + 1
                 if now - previous_time <= 0.75:
-                    return previous_x, cursor_x, previous_w, max(0.0, confidence * 0.55)
-                return None, cursor_x, target_w, confidence
+                    return previous_x, cursor_x, previous_w, max(0.0, confidence * 0.55), False
+                return None, cursor_x, target_w, confidence, False
             jump = abs(target_x - previous_x)
             jump_limit = max(56, int(roi_width * 0.18), int(max(previous_w, target_w) * 1.55))
             if jump > jump_limit and confidence < 0.82:
                 self._sm.round.bar_jump_reject_count = int(getattr(self._sm.round, "bar_jump_reject_count", 0)) + 1
                 if self._sm.round.bar_jump_reject_count <= 3 and now - previous_time <= 0.65:
-                    return previous_x, cursor_x, previous_w, max(0.0, confidence * 0.7)
-                return None, cursor_x, target_w, confidence
+                    return previous_x, cursor_x, previous_w, max(0.0, confidence * 0.7), False
+                return None, cursor_x, target_w, confidence, False
 
         self._sm.round.last_valid_target_x = int(target_x)
         self._sm.round.last_valid_target_w = int(target_w)
@@ -70,7 +72,7 @@ class FishingBarDetector:
         self._sm.round.last_valid_cursor_time = now
         self._sm.round.bar_jump_reject_count = 0
         self._sm.round.bar_cursor_jump_reject_count = 0
-        return target_x, cursor_x, target_w, confidence
+        return target_x, cursor_x, target_w, confidence, False
 
     # ------------------------------------------------------------------
     # 坐标转换
@@ -93,7 +95,7 @@ class FishingBarDetector:
         if self._sm.debug_queue is None or self._sm.debug_queue.qsize() >= 2:
             return False
         now = time.time()
-        return getattr(self._sm, "_last_debug_time", 0) == 0 or (now - self._sm._last_debug_time) >= 0.25
+        return getattr(self._sm, "_last_debug_time", 0) == 0 or (now - self._sm._last_debug_time) >= 0.10
 
     # ------------------------------------------------------------------
     # 游标模板选择
@@ -128,7 +130,12 @@ class FishingBarDetector:
                 "capture_failed": True,
             }
 
-        target_x, cursor_x, target_w, debug_img, confidence = self._sm.vis.analyze_fishing_bar(
+        fps_val = None
+        latency_val = None
+        if draw_debug:
+            t0 = time.time()
+
+        result = self._sm.vis.analyze_fishing_bar(
             bar_img,
             cursor_template_paths=self.cursor_templates_for_current_frame(),
             cursor_color_reference_paths=self._sm.tpl.cursor_templates(),
@@ -136,7 +143,23 @@ class FishingBarDetector:
             cursor_scale_range=self._sm.tpl.scale_range(rect, 0.70, 1.55),
             cursor_scale_steps=5,
             draw_debug=draw_debug,
+            fps=self._debug_fps if draw_debug else None,
+            latency_ms=self._debug_latency_ms if draw_debug else None,
         )
+        target_x, cursor_x, target_w, debug_img, confidence = result[:5]
+        debug_meta = result[5] if len(result) > 5 else None
+
+        if draw_debug:
+            latency_val = (time.time() - t0) * 1000.0
+            self._debug_latency_ms = latency_val
+            now = time.time()
+            prev = getattr(self._sm, "_last_debug_time", 0)
+            if prev > 0:
+                dt = now - prev
+                if dt > 0:
+                    self._debug_fps = 1.0 / dt
+            # _last_debug_time is updated later in state_machine.py when queued
+
         target_x, cursor_x = self.bar_local_to_client_x(rect, roi, target_x, cursor_x)
         return {
             "target_x": target_x,
@@ -147,6 +170,7 @@ class FishingBarDetector:
             "width": bar_img.shape[1],
             "roi": roi,
             "capture_failed": False,
+            "debug_meta": debug_meta,
         }
 
     # ------------------------------------------------------------------
@@ -165,14 +189,16 @@ class FishingBarDetector:
             self._sm.round.last_bar_capture_failed = True
             return None, None, None, None, 0.0
 
-        target_x, cursor_x, target_w, confidence = self.filter_bar_detection(
+        filtered = self.filter_bar_detection(
             primary.get("target_x"),
             primary.get("cursor_x"),
             primary.get("target_w"),
             primary.get("confidence"),
             primary.get("width") or int(rect[2] * primary_roi[2]),
         )
-        return target_x, cursor_x, target_w, primary.get("debug_img"), confidence
+        target_x, cursor_x, target_w, confidence = filtered[:4]
+        is_stale = filtered[4] if len(filtered) > 4 else False
+        return target_x, cursor_x, target_w, primary.get("debug_img"), confidence, is_stale, primary.get("debug_meta")
 
     # ------------------------------------------------------------------
     # 断帧保持
@@ -253,4 +279,5 @@ class FishingBarDetector:
         self._sm.round.seen_fishing_bar = False
         self._sm.round.last_target_time = 0
         self._sm.round.target_velocity = 0
+        self._sm._push_debug_status_frame("bar missing -> RESULT")
         self._sm.current_state = self._sm.STATE_RESULT

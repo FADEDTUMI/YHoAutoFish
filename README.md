@@ -16,7 +16,7 @@
     <img alt="No Injection" src="https://img.shields.io/badge/no%20injection-screen%20vision-1DD0D6?style=flat-square">
     <img alt="Admin" src="https://img.shields.io/badge/admin-required-FF667E?style=flat-square">
     <img alt="Local Data" src="https://img.shields.io/badge/data-local%20only-6FE39A?style=flat-square">
-    <img alt="Version" src="https://img.shields.io/badge/version-1.4.0-63E4E4?style=flat-square">
+    <img alt="Version" src="https://img.shields.io/badge/version-1.4.1-63E4E4?style=flat-square">
   </p>
 </div>
 
@@ -26,11 +26,11 @@ YHo AutoFish 仅用于图像识别、桌面自动化流程学习与个人技术�
 
 使用自动化工具仍可能违反游戏或平台规则，并可能带来账号、收益、设备环境或其他风险。请只在你充分理解并能自行承担后果的前提下使用。禁止商业代练、批量传播、二次售卖、卡密售卖、冒充官方工具或任何侵权用途。
 
-本程序开源免费发布。若你从付费渠道获得本程序，请立即停止付款，并优先从项目 Release 页面获取发布包。
+本程序以源码可见（Source-Available）方式免费发布，禁止二次分发、再分发及商业使用。若你从付费渠道获得本程序，请立即停止付款，并优先从项目 Release 页面获取发布包。
 
-## 1.4.0 版本重点
+## 1.4.1 版本重点
 
-1.4.0 是一次重大升级：全新 v2 授权认证系统、全局埋点追踪、战绩分享、强制更新机制，同时切换至 Nuitka 编译打包以增强代码安全保护。
+1.4.1 是 v1.4.0 的稳定性修复版本：全新 v2 授权认证系统、全局埋点追踪、战绩分享、强制更新机制，同时切换至 Nuitka 编译打包以增强代码安全保护。
 
 - 全新 v2 JWT 认证系统，支持 token 刷新与多主机故障自动切换。
 - 新增 ECDSA-P256 离线 License 验证，断网场景下仍可正常运行。
@@ -45,13 +45,13 @@ YHo AutoFish 仅用于图像识别、桌面自动化流程学习与个人技术�
 - ESC 按键安全强化，全局防抖确保间隔 ≥300ms，自动售鱼两次 ESC 间隔 ≥1s。
 - 新增 11 种鱼类/收藏品适配（星斑鱼、海星、海中栗、金梭子、红/蓝/绿鳞旗、泡水的异象市民证、灯塔、黑夜蝠鲼、条纹椰），OCR 混淆字符表扩充。
 
-完整发布说明见 [release_notes_v1.4.0.md](release_notes_v1.4.0.md)。
+完整发布说明见 [release_notes_v1.4.1.md](release_notes_v1.4.1.md)。
 
 ## 下载与运行
 
 推荐使用 GitHub Release 中的压缩包，不需要自己配置 Python 环境。
 
-1. 下载 `YHoAutoFish-v1.4.0-windows.zip`。
+1. 下载 `YHoAutoFish-v1.4.1-windows.zip`。
 2. 解压到一个固定目录，不要直接在压缩包内运行。
 3. 打开《异环》，进入可以钓鱼的位置。
 4. 运行 `YHoAutoFish.exe`。
@@ -154,7 +154,7 @@ YHo AutoFish 仅用于图像识别、桌面自动化流程学习与个人技术�
 
 自动检查和手动检查更新都会优先读取 GitHub 官方 `latest.json`；如果 GitHub 不可用或 GitHub 当前没有比本地更新的版本，会继续尝试 Gitee。Gitee 默认会先请求 `https://gitee.com/api/v5/repos/fadedtumi/YHoAutoFish/releases/latest` 获取最新发行版标签，再读取 `https://gitee.com/fadedtumi/YHoAutoFish/releases/download/{tag}/latest.json`。如果直链 `latest.json` 偶发返回 502，程序会继续尝试 Gitee Release 附件下载接口。`update_check_interval_minutes` 控制后台轮询间隔，建议保持 30 分钟或更长；手动检查始终立即执行。`update_download_urls`、`update_gitee_download_urls` 支持 `{version}`、`{tag}`、`{asset_name}` 占位符。即使使用备用下载源，程序仍会按 `latest.json` 中的 SHA256 校验更新包，校验失败会拒绝安装。
 
-Gitee 国内源使用连续分卷附件，例如 `YHoAutoFish-v1.4.0-windows.zip.001`、`.002`、`.003`。程序会自动下载所有分卷、校验 SHA256、合并为完整更新包并安装，普通用户不需要手动合并分卷。若下载过程中点击取消，程序会清理未完成的分卷、合并包和临时目录。
+Gitee 国内源使用连续分卷附件，例如 `YHoAutoFish-v1.4.1-windows.zip.001`、`.002`、`.003`。程序会自动下载所有分卷、校验 SHA256、合并为完整更新包并安装，普通用户不需要手动合并分卷。若下载过程中点击取消，程序会清理未完成的分卷、合并包和临时目录。
 
 ## 数据保存
 
@@ -184,7 +184,7 @@ Gitee 国内源使用连续分卷附件，例如 `YHoAutoFish-v1.4.0-windows.zip
 
 ## 发行文件说明
 
-普通用户只需要下载 `YHoAutoFish-v1.4.0-windows.zip`，解压后运行 `YHoAutoFish.exe`。
+普通用户只需要下载 `YHoAutoFish-v1.4.1-windows.zip`，解压后运行 `YHoAutoFish.exe`。
 
 GitHub Release 提供完整压缩包；Gitee Release 可能因附件体积限制提供 `.zip.001`、`.zip.002` 等分卷。分卷主要用于程序自动更新，手动下载安装时建议优先使用 GitHub 完整压缩包；如果只能使用 Gitee 分卷，请下载所有连续分卷后按文件名顺序合并为完整 zip 再解压。
 
@@ -192,12 +192,12 @@ GitHub Release 提供完整压缩包；Gitee Release 可能因附件体积限制
 
 ## 许可
 
-本项目采用自定义限制性许可证：[LICENSE](LICENSE)。
+本项目采用源码可见（Source-Available）自定义限制性许可证：[LICENSE](LICENSE)。
 
-允许个人学习、研究、查看源码和本地非商业使用。未经作者书面许可，禁止商用、二次修改分发、打包转卖、转载镜像、改名发布、去除署名或制作衍生收费版本。
+允许个人学习、研究、查看源码和本地非商业使用。本项目不是开源软件，源码公开仅为透明与审查目的。未经作者书面许可，禁止商用、二次分发、再分发、二次修改分发、打包转卖、转载镜像、改名发布、去除署名或制作衍生收费版本。
 
 ## 项目信息
 
 - 作者：`FADEDTUMI`
 - 项目地址：`https://github.com/FADEDTUMI/YHoAutoFish`
-- 当前版本：`1.4.0`
+- 当前版本：`1.4.1`

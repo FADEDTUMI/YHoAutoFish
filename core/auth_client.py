@@ -117,17 +117,19 @@ def _default_recovery_message(mode, status, check_result=None):
     if mode == "transient_error":
         return raw_message or "授权服务器暂时不可达，请稍后重试。"
     if mode == "admin_blocked":
-        return "授权已被管理员停用，不能自助重新绑定，请联系管理员处理。"
+        return raw_message or "授权已被管理员停用，不能自助重新绑定，请联系管理员处理。"
     if mode == "device_mismatch":
-        return "这是其他设备的授权缓存，本机需要重新绑定。"
+        return raw_message or "这是其他设备的授权缓存，本机需要重新绑定。"
     if mode == "can_rebind":
+        if raw_message:
+            return raw_message
         if status == "released":
             return "旧设备授权已释放，可生成新绑定码重新绑定本机。"
         if status == "expired":
             return "授权已过期，可生成新绑定码重新绑定本机。"
         if status == "token_already_issued":
             return "这个绑定码已经领取过授权，请生成新绑定码重新绑定本机。"
-        return "服务器未找到旧授权记录，可能是换机/挂失释放或重绑完成；可生成新绑定码重新绑定本机。"
+        return "服务器未找到旧授权记录，可生成新绑定码重新绑定本机。"
     return raw_message or "授权缓存过期，请联网复验。"
 
 
@@ -294,7 +296,8 @@ class AuthClient:
 
     def _get_ssl_context(self):
         if not self.ca_bundle_path:
-            return None
+            # 域名主机：使用默认 context（main.py monkey-patch 自动叠加 certifi CA）
+            return ssl.create_default_context()
         if not Path(self.ca_bundle_path).is_file():
             refreshed = find_auth_ca_bundle()
             self.ca_bundle_path = refreshed
@@ -302,7 +305,11 @@ class AuthClient:
         if not self.ca_bundle_path or not Path(self.ca_bundle_path).is_file():
             raise AuthClientError("授权证书文件缺失，请重新解压完整程序包后再启动")
         if self._ssl_context is None:
-            self._ssl_context = ssl.create_default_context(cafile=self.ca_bundle_path)
+            # IP 主机：使用自定义 CA，但跳过 key usage 检查（CA 证书缺少 key usage 扩展）
+            self._ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            self._ssl_context.load_verify_locations(cafile=self.ca_bundle_path)
+            self._ssl_context.check_hostname = False
+            self._ssl_context.verify_mode = ssl.CERT_REQUIRED
         return self._ssl_context
 
     def _request(self, method, path, payload=None, token=None):

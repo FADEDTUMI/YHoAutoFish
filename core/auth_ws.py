@@ -42,12 +42,16 @@ def _build_ws_ssl_context(host):
             from core.auth_client import find_auth_ca_bundle
             ca_path = find_auth_ca_bundle()
             if ca_path:
-                ctx = ssl.create_default_context(cafile=ca_path)
+                # IP 主机：使用自定义 CA，但跳过 key usage 检查
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx.load_verify_locations(cafile=ca_path)
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_REQUIRED
                 return ctx
         except Exception:
             pass
-        return ssl.create_default_context()
-    return None
+    # 域名主机或 IP 自定义 CA 不可用时：使用默认 context（main.py monkey-patch 自动叠加 certifi CA）
+    return ssl.create_default_context()
 
 
 class AuthWSWorker(QThread):

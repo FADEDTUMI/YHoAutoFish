@@ -58,7 +58,10 @@ class FishingControl:
         if current:
             if signed_error <= -pixels["switch_error"]:
                 return -current
-            if now < getattr(sm.round, "fish_control_min_hold_until", 0) and signed_error > -pixels["switch_error"]:
+            # 零交叉：已越过目标中心，立即释放，无视 hold time
+            if signed_error <= 0:
+                return 0
+            if now < getattr(sm.round, "fish_control_min_hold_until", 0):
                 return current
             if signed_error <= -pixels["release_cross"]:
                 return 0
