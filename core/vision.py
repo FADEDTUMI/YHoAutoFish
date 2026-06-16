@@ -14,7 +14,7 @@ class VisionCore:
         # 预分配固定尺寸形态学核，避免每帧重复创建
         self._kernel_3x3 = np.ones((3, 3), np.uint8)
         self._kernel_2x3 = np.ones((2, 3), np.uint8)
-        
+
     def update_hsv_config(self, color_name, min_val, max_val):
         """用于GUI动态调节HSV参数"""
         if color_name in self.hsv_config:
@@ -197,16 +197,16 @@ class VisionCore:
                 return None, 0.0
             if use_binary and cv2.countNonZero(screen_gray) < 5:
                 return None, 0.0
-            
+
             best_match = None
             best_val = -1
             best_loc = None
-            
+
             for scale in self._build_scales(scale_range=scale_range, scale_steps=scale_steps):
                 # 缩放模板
                 width = int(round(template_gray.shape[1] * scale))
                 height = int(round(template_gray.shape[0] * scale))
-                
+
                 # 如果缩放后的模板比截图还要大，就跳过
                 if width < 4 or height < 4 or width > screen_gray.shape[1] or height > screen_gray.shape[0]:
                     continue
@@ -229,7 +229,7 @@ class VisionCore:
                         match_method = cv2.TM_CCORR_NORMED
                     else:
                         resized_mask = None
-                
+
                 # 进行匹配
                 if resized_mask is not None:
                     res = cv2.matchTemplate(screen_gray, resized_template, match_method, mask=resized_mask)
@@ -238,7 +238,7 @@ class VisionCore:
                 res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
                 min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
                 max_val = max(-1.0, min(1.0, float(max_val)))
-                
+
                 if max_val > best_val:
                     best_val = max_val
                     best_loc = max_loc
@@ -641,7 +641,11 @@ class VisionCore:
                 cursor = self._select_cursor_candidate(cursor_candidates, green_candidates, roi_w, roi_h)
         if cursor is None:
             if debug_img is not None:
-                cv2.putText(debug_img, "cursor missing", (4, max(12, roi_h - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
+                #修复调试文字不可见
+                info_h = int(roi_w * 0.06)
+                info_bar = np.full((info_h, roi_w, 3), (28, 28, 28), dtype=np.uint8)
+                cv2.putText(info_bar, "cursor missing", (4, int(info_h * 0.80)), cv2.FONT_HERSHEY_DUPLEX, info_h / 32.0,(60, 60, 255), 2, cv2.LINE_AA)
+                debug_img = np.vstack([debug_img, info_bar])
             return None, None, None, debug_img, 0.0
 
         band_half = max(6, int(cursor["h"] * 0.85), int(roi_h * 0.22))
@@ -762,12 +766,23 @@ class VisionCore:
                     1,
                 )
                 cv2.line(debug_img, (target_x, 0), (target_x, roi_h), (0, 255, 0), 2)
+
+            # 修复调试层不可见
+            info_h = int(roi_w * 0.12)
+            font_s = info_h / 66.0
+            info_bar = np.full((info_h, roi_w, 3), (28, 28, 28), dtype=np.uint8)
             source = cursor.get("source", "color")
+            line1_parts = [f"cur:{cursor_x}"]
             if target:
-                track_score = target.get("track_score", 0.0)
-                cv2.putText(debug_img, f"conf {confidence:.2f} {source} rail {track_score:.2f}", (4, max(12, roi_h - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+                line1_parts.append(f"tgt:{target_x}")
+                line1_parts.append(f"trk:{target.get('track_score', 0):.2f}")
             else:
-                cv2.putText(debug_img, f"conf {confidence:.2f} {source}", (4, max(12, roi_h - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+                line1_parts.append("tgt:---")
+            line1 = " | ".join(line1_parts)
+            line2 = f"c:{confidence:.2f}  {source}"
+            cv2.putText(info_bar, line1, (4, int(info_h * 0.40)), cv2.FONT_HERSHEY_DUPLEX, font_s, (210, 210, 210), 2, cv2.LINE_AA)
+            cv2.putText(info_bar, line2, (4, int(info_h * 0.90)), cv2.FONT_HERSHEY_DUPLEX, font_s, (210, 210, 210), 2, cv2.LINE_AA)
+            debug_img = np.vstack([debug_img, info_bar])
 
         return target_x, cursor_x, target_w, debug_img, confidence
 
@@ -938,8 +953,8 @@ class VisionCore:
             center_score = 1.0 - min(1.0, abs(cy - roi_h * 0.5) / max(1.0, roi_h * 0.65))
             color_concentration = 0.5
             if hsv_roi is not None:
-                region_mask = (labels[y:y+h, x:x+w] == index)
-                region_hsv = hsv_roi[y:y+h, x:x+w][region_mask]
+                region_mask = (labels[y:y + h, x:x + w] == index)
+                region_hsv = hsv_roi[y:y + h, x:x + w][region_mask]
                 if len(region_hsv) > 10:
                     h_std = float(np.std(region_hsv[:, 0].astype(float)))
                     color_concentration = max(0.0, min(1.0, 1.0 - (h_std / 20.0)))
@@ -1564,30 +1579,30 @@ class VisionCore:
         """从二值化掩码中找到最大的合法轮廓，并返回中心X坐标 (以及可选的宽度)"""
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours: return None
-        
+
         # 按照面积从大到小排序，只取最大的那个，防止被背景的小噪点干扰
         contours = sorted(contours, key=cv2.contourArea, reverse=True)
-        
+
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
             area = w * h
-            
+
             # 忽略过小的噪点
-            if area < 5: 
+            if area < 5:
                 continue
-                
+
             if strict_shape:
                 # 宽容的形态学过滤：
                 # 黄色游标 (is_vertical=True) 应该是竖着的，高大于宽，放宽要求
-                if is_vertical and w > h * 1.8: 
+                if is_vertical and w > h * 1.8:
                     continue
-                    
+
                 # 绿色目标条 (is_vertical=False) 应该是横着的，宽大于高
                 if not is_vertical and h > w * 1.8:
                     continue
-                
+
             if return_width:
                 return x + w // 2, w
             return x + w // 2
-            
+
         return None
