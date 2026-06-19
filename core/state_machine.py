@@ -69,6 +69,7 @@ class StateMachine:
         self._auto_sell_ready_wait_started = 0
         self._auto_sell_capture_hidden = False
         self._last_esc_time = 0.0
+        self._background_mode = False
 
         # 实例化真正的 PID 控制器
         # Kp: 比例，影响追赶速度
@@ -137,8 +138,10 @@ class StateMachine:
         with self._input_lock:
             if self._should_stop():
                 return False
-            if self.wm.is_foreground() and self._check_user_takeover():
-                return False
+            # 后台模式下跳过前台焦点检查和用户接管检查
+            if not self._background_mode:
+                if self.wm.is_foreground() and self._check_user_takeover():
+                    return False
             self._note_program_input((key,), duration=float(duration) + 0.45)
             self.ctrl.key_tap(key, duration=duration)
             if key == 'esc':
@@ -179,8 +182,10 @@ class StateMachine:
         with self._input_lock:
             if self._should_stop():
                 return False
-            if self.wm.is_foreground() and self._check_user_takeover():
-                return False
+            # 后台模式下跳过前台焦点检查和用户接管检查
+            if not self._background_mode:
+                if self.wm.is_foreground() and self._check_user_takeover():
+                    return False
             self._note_program_input(("mouse_left",), duration=float(duration) + 0.65)
             return self.ctrl.mouse_click(x, y, duration=duration)
 
@@ -207,6 +212,9 @@ class StateMachine:
             self.log_queue.put(f"CMD_USER_TAKEOVER_PAUSED::{detail}")
 
     def _check_user_takeover(self, game_rect=None):
+        # 后台模式下跳过用户接管检测（用户正在使用其他应用）
+        if self._background_mode:
+            return False
         if self._should_stop() or getattr(self, "user_activity", None) is None:
             return False
         reason = self.user_activity.check(
@@ -279,6 +287,25 @@ class StateMachine:
             self.user_activity.update_config(start_grace=value)
         elif key == "user_takeover_exclude_rects":
             self._user_takeover_exclude_rects = self._normalize_exclude_rects(value)
+        elif key == "background_mode":
+            with self._input_lock:
+                self._apply_background_mode(bool(value))
+
+    def _apply_background_mode(self, enabled):
+        """应用后台模式设置，传播到各子系统。"""
+        self._background_mode = enabled
+        hwnd = self.wm.hwnd if self.wm.is_window_alive() else None
+        if self.sc is not None:
+            self.sc.set_background_mode(enabled, hwnd)
+        self.ctrl.set_background_mode(enabled, hwnd)
+        # 后台模式下禁用用户接管检测（用户正在使用其他应用）
+        if enabled:
+            self.user_activity.update_config(enabled=False)
+            self._log("[后台模式] 已启用后台钓鱼。游戏可被遮挡但不能最小化。用户接管检测已禁用。")
+        else:
+            self.user_activity.update_config(
+                enabled=self.config.get("user_takeover_protection", True))
+            self._log("[后台模式] 已关闭后台钓鱼，恢复前台模式。")
 
     def _normalize_exclude_rects(self, rects):
         normalized = []
@@ -500,7 +527,11 @@ class StateMachine:
     def _run_loop(self):
         # 确保在当前线程中实例化 ScreenCapture
         self.sc = ScreenCapture()
-        
+        # 如果已配置后台模式，立即应用到截图实例
+        if self._background_mode and self.wm.is_window_alive():
+            self.sc.set_background_mode(True, self.wm.hwnd)
+            self.ctrl.set_background_mode(True, self.wm.hwnd)
+
         # 初始化与绑定窗口
         if not self.wm.find_window():
             self._log("错误: 未找到游戏进程 HTGame.exe。请确保游戏正在运行。")
@@ -513,7 +544,13 @@ class StateMachine:
             self._log(f"成功绑定游戏窗口。客户区: {initial_rect[2]}x{initial_rect[3]}，DPI倍率: {dpi_scale:.2f}")
         else:
             self._log(f"成功绑定游戏窗口。DPI倍率: {dpi_scale:.2f}")
-        self.wm.set_foreground()
+        # find_window 成功后，补一次后台模式传播（确保 hwnd 正确）
+        if self._background_mode:
+            self.sc.set_background_mode(True, self.wm.hwnd)
+            self.ctrl.set_background_mode(True, self.wm.hwnd)
+        # 后台模式下不强制置顶游戏窗口
+        if not self._background_mode:
+            self.wm.set_foreground()
         if not self._sleep_interruptible(1): # 等待窗口置顶完成
             self.sc.close()
             return
@@ -534,28 +571,38 @@ class StateMachine:
         debug_save_count = 0
 
         while self.is_running:
-            # 1. 焦点保护机制
-            if not self.wm.is_foreground():
-                # 检查当前焦点是否是被我们自己的 Debug 窗口抢走了
-                import win32gui
-                fg_hwnd = win32gui.GetForegroundWindow()
-                if win32gui.GetWindowText(fg_hwnd) == "Fishing Bar Tracker (Debug)":
-                    # 如果是被 Debug 窗口抢走的，不要暂停按键，尝试切回去
-                    self.wm.set_foreground()
-                else:
-                    self._log("警告: 游戏窗口失去焦点，暂停按键发送。")
-                    self.ctrl.release_all()
-                    if not self._sleep_interruptible(1):
-                        break
-                    continue
+            # 1. 焦点保护机制（后台模式下跳过）
+            if not self._background_mode:
+                if not self.wm.is_foreground():
+                    # 检查当前焦点是否是被我们自己的 Debug 窗口抢走了
+                    import win32gui
+                    fg_hwnd = win32gui.GetForegroundWindow()
+                    if win32gui.GetWindowText(fg_hwnd) == "Fishing Bar Tracker (Debug)":
+                        # 如果是被 Debug 窗口抢走的，不要暂停按键，尝试切回去
+                        self.wm.set_foreground()
+                    else:
+                        self._log("警告: 游戏窗口失去焦点，暂停按键发送。")
+                        self.ctrl.release_all()
+                        if not self._sleep_interruptible(1):
+                            break
+                        continue
 
             # 2. 获取实时窗口坐标 (防止窗口被拖动)
             rect = self.wm.get_client_rect()
             if not rect:
-                self._log("获取窗口坐标失败，请不要最小化游戏。")
+                if self._background_mode:
+                    self._log("获取窗口坐标失败，游戏窗口可能已最小化。后台模式不支持最小化。")
+                else:
+                    self._log("获取窗口坐标失败，请不要最小化游戏。")
                 if not self._sleep_interruptible(1):
                     break
                 continue
+
+            # 后台模式下每帧更新坐标原点并截取一次完整画面缓存
+            if self._background_mode and self.sc and rect:
+                self.sc.set_capture_origin(rect[0], rect[1])
+                self.ctrl.set_click_origin(rect[0], rect[1])
+                self.sc.begin_frame()  # 帧级缓存：一次 PrintWindow，所有 ROI 共享
 
             if self._check_user_takeover(game_rect=rect):
                 break
@@ -1109,7 +1156,7 @@ class StateMachine:
         self._sleep_interruptible(0.2)
 
     def _handle_failed(self):
-        # 注意: 这里的“溜走了”如果用户提供了图片，建议也走 find_template
+        # 注意: 这里的"溜走了"如果用户提供了图片，建议也走 find_template
         # 目前暂时作为占位或使用超时跳出
         self._log("[失败/结束] 释放按键，等待复位。")
         self._enter_recovering("进入失败兜底状态", record_empty=True, press_esc=False)

@@ -33,5 +33,6 @@
     "sponsor_button_hidden": false,
     "sponsor_qr_dir": "sponsor_qr",
     "minimal_settlement_mode": false,
-    "minimal_mode_wait": 2.5
+    "minimal_mode_wait": 2.5,
+    "background_mode": true
 }

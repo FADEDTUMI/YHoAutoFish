@@ -3335,6 +3335,11 @@ class FloatingControlWindow(QFrame):
         self._active_page_index = 0
         self._last_log_version = -1
         self._last_log_text = None
+        # --- 后台模式拖动相关 ---
+        self._background_mode = False
+        self._user_dragging = False
+        self._drag_offset = None
+        self._user_manually_positioned = False  # 用户是否已手动定位
         self.setWindowTitle("异环自动钓鱼悬浮控制")
         self.setWindowFlags(
             Qt.Tool
@@ -3684,6 +3689,12 @@ class FloatingControlWindow(QFrame):
 
         rect = self._current_game_rect(allow_find=True)
         if rect is None:
+            # 后台模式下保持悬浮窗可见（游戏可能被遮挡但未最小化）
+            if self._background_mode:
+                if not self.isVisible():
+                    self.show()
+                    self.raise_()
+                return
             self._hide_until_game_visible()
             return
 
@@ -3873,6 +3884,10 @@ class FloatingControlWindow(QFrame):
         if not self.isVisible():
             return
 
+        # 后台模式下用户已手动定位时不自动定位
+        if self._background_mode and self._user_manually_positioned:
+            return
+
         if rect is None:
             rect = self._current_game_rect(allow_find=True)
 
@@ -3887,6 +3902,52 @@ class FloatingControlWindow(QFrame):
         self._move_to_target(target)
         if hasattr(self.app_window, "_sync_user_takeover_exclude_rects"):
             self.app_window._sync_user_takeover_exclude_rects()
+
+    # ------------------------------------------------------------------
+    #  后台模式: 拖动支持
+    # ------------------------------------------------------------------
+
+    def set_background_mode(self, enabled):
+        """设置后台模式。启用时悬浮窗可拖动，禁用时恢复自动定位。"""
+        self._background_mode = bool(enabled)
+        if enabled:
+            self.setCursor(Qt.OpenHandCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+            self._user_dragging = False
+            self._drag_offset = None
+            self._user_manually_positioned = False
+
+    def mousePressEvent(self, event):
+        """后台模式下支持拖动悬浮窗。"""
+        if self._background_mode and event.button() == Qt.LeftButton:
+            self._user_dragging = True
+            self._drag_offset = event.globalPosition().toPoint() - self.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """后台模式下拖动悬浮窗。"""
+        if self._user_dragging and self._drag_offset is not None:
+            new_pos = event.globalPosition().toPoint() - self._drag_offset
+            self.move(new_pos)
+            self._last_target_pos = None  # 防止定时器 snap 回去
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        """后台模式下结束拖动。"""
+        if self._user_dragging and event.button() == Qt.LeftButton:
+            self._user_dragging = False
+            self._drag_offset = None
+            self._user_manually_positioned = True  # 锁定位置，不再 snap 回去
+            self.setCursor(Qt.OpenHandCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -5112,6 +5173,10 @@ class AppWindow(QMainWindow):
         self.sm.update_config("auto_sell_catch_threshold", self.config.get("auto_sell_catch_threshold", 0))
         self.sm.update_config("minimal_settlement_mode", self.config.get("minimal_settlement_mode", False))
         self.sm.update_config("minimal_mode_wait", self.config.get("minimal_mode_wait", 2.5))
+        self.sm.update_config("background_mode", self.config.get("background_mode", False))
+        # 同步后台模式到悬浮窗
+        if hasattr(self, 'floating_window') and self.floating_window is not None:
+            self.floating_window.set_background_mode(self.config.get("background_mode", False))
 
     def _refresh_debug_view_state(self):
         if not hasattr(self, "debug_preview"):
@@ -5698,6 +5763,9 @@ class AppWindow(QMainWindow):
     def toggle_floating_window(self):
         if self.floating_window is None:
             self.floating_window = FloatingControlWindow(self)
+            # 创建时同步后台模式状态
+            self.floating_window.set_background_mode(
+                self.config.get("background_mode", False))
 
         if self.floating_window.user_visible_requested:
             self.floating_window.set_user_visible_requested(False)
@@ -6425,6 +6493,23 @@ class AppWindow(QMainWindow):
         safety_keys.append("user_takeover_start_grace")
         safety_layout.addStretch()
         self._add_settings_category("安全接管", safety_page, safety_keys)
+
+        # === 后台钓鱼设置 ===
+        background_page, background_layout = self._build_settings_category_page(
+            "后台钓鱼",
+            "开启后，游戏可以在其他窗口后面继续钓鱼（不能最小化）。使用 PrintWindow 截图和 PostMessage 按键。注意：部分游戏引擎可能不响应后台按键，若无效请关闭此模式。开启此模式会自动禁用用户接管检测。",
+        )
+        background_keys = []
+        self.background_mode_button = self._settings_toggle_block(
+            background_layout,
+            "后台钓鱼模式",
+            "开启后截图和输入切换为后台兼容方案。游戏窗口不能最小化，但可以被其他窗口遮挡。",
+            self.config.get("background_mode", False),
+            "background_mode",
+        )
+        background_keys.append("background_mode")
+        background_layout.addStretch()
+        self._add_settings_category("后台钓鱼", background_page, background_keys)
 
         display_page, display_layout = self._build_settings_category_page(
             "界面与日志",
